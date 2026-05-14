@@ -9,6 +9,7 @@ pub const EDGE_SCHEMA_VERSION: &str = "minimap.edge.v1";
 pub const ROUTE_SCHEMA_VERSION: &str = "minimap.route.v1";
 pub const PROPOSAL_SCHEMA_VERSION: &str = "minimap.proposal.v1";
 pub const RESULT_SCHEMA_VERSION: &str = "minimap.result.v1";
+pub const JOURNAL_ENTRY_SCHEMA_VERSION: &str = "minimap.journal_entry.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct GraphContext(pub BTreeMap<String, Value>);
@@ -53,7 +54,9 @@ fn value_matches(current: Option<&Value>, required: &Value) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScreenNode {
     pub schema_version: String,
+    /// Stable handle (`screen_<hash8>`); edges reference this. Never renamed.
     pub id: String,
+    /// Best-effort auto-derived display name. Mutable — `screen rename` rewrites it.
     pub name: String,
     pub identity_hash: String,
     #[serde(default)]
@@ -99,7 +102,9 @@ pub struct SelectorCandidate {
 pub struct NavigationEdge {
     pub schema_version: String,
     pub id: String,
+    /// Stable `ScreenNode.id` reference (e.g. `screen_<hash8>`). Never a display name.
     pub from_screen: String,
+    /// Stable `ScreenNode.id` reference (e.g. `screen_<hash8>`). Never a display name.
     pub to_screen: String,
     pub action: TapRecipe,
     #[serde(default)]
@@ -120,27 +125,11 @@ pub struct Route {
     pub name: String,
     pub target: Value,
     #[serde(default)]
-    pub intent: Option<String>,
-    #[serde(default)]
-    pub start: Value,
-    #[serde(default)]
-    pub preferred_edge_ids: Vec<String>,
-    #[serde(default = "default_true")]
-    pub allow_graph_fallback: bool,
-    #[serde(default)]
-    pub path_constraints: Value,
-    #[serde(default)]
-    pub checks: Vec<Value>,
+    pub from: Option<Value>,
     #[serde(default)]
     pub triggers: Vec<Value>,
     #[serde(default)]
     pub aliases: Vec<String>,
-    #[serde(default)]
-    pub context_guard: BTreeMap<String, Value>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Route {
@@ -148,19 +137,24 @@ impl Route {
         self.target.get("screen").and_then(Value::as_str)
     }
 
-    pub fn start_screen(&self) -> Option<&str> {
-        self.start.get("screen").and_then(Value::as_str)
+    pub fn from_screen(&self) -> Option<&str> {
+        self.from.as_ref()?.get("screen").and_then(Value::as_str)
     }
+}
 
-    pub fn combined_context_guard(&self) -> BTreeMap<String, Value> {
-        let mut guard = self.context_guard.clone();
-        if let Some(start_guard) = self.start.get("context_guard").and_then(Value::as_object) {
-            for (key, value) in start_guard {
-                guard.insert(key.clone(), value.clone());
-            }
-        }
-        guard
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JournalEntry {
+    pub schema_version: String,
+    pub ts: i64,
+    #[serde(default)]
+    pub from_screen_id: Option<String>,
+    #[serde(default)]
+    pub edge_id: Option<String>,
+    #[serde(default)]
+    pub to_screen_id: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

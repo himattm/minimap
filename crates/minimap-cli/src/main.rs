@@ -7,14 +7,22 @@ use minimap_android::{
 use minimap_core::{identity_hash, match_screen, normalize_layout};
 use minimap_graph::{exit_code_for_status, resolve_route};
 use minimap_repo::{
-    accept_proposal, load_context, load_graph, observe_current, observe_current_or_latest,
-    observe_start, observe_stop, read_json, record_action_event, record_observation_event,
-    run_init, stage_observation_review_proposal, stage_proposal_value,
+    accept_proposal, append_journal_entry, commit_edge, commit_route, commit_screen,
+    detect_legacy_minimap, load_context, load_graph, rename_screen, run_init, screen_path,
+    stage_proposal_value, LEGACY_MINIMAP_MESSAGE,
 };
-use minimap_schemas::NavigationEdge;
-use minimap_schemas::{canonical_json, MinimapResult, RESULT_SCHEMA_VERSION};
-use serde_json::json;
+use minimap_schemas::{
+    canonical_json, JournalEntry, MinimapResult, NavigationEdge, JOURNAL_ENTRY_SCHEMA_VERSION,
+    RESULT_SCHEMA_VERSION, ROUTE_SCHEMA_VERSION,
+};
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Post-tap settle: give the device a moment to render the new layout before re-querying it.
+const POST_TAP_SETTLE_MS: u64 = 500;
 
 #[derive(Debug, Parser)]
 #[command(name = "minimap")]
@@ -40,6 +48,9 @@ enum Commands {
         dry_run: bool,
         #[arg(long, default_value = "auto")]
         agents: String,
+        /// Bypass the legacy `.minimap/` check and overwrite any 0.1.x tree.
+        #[arg(long)]
+        force: bool,
     },
     /// Diagnose the Minimap environment (config, graph dirs, android/adb on PATH).
     Doctor,
@@ -48,7 +59,7 @@ enum Commands {
         #[arg(long)]
         diff: bool,
     },
-    /// Tap a UI element by --selector kind=value, --point X,Y, or --label N (with --screenshot); pass --reason to record intent.
+    /// Tap a UI element by --selector kind=value, --point X,Y, or --label N (with --screenshot); pass --reason to record intent. Selector/label taps grow the graph atomically.
     Tap {
         #[arg(long)]
         selector: Option<String>,
@@ -63,23 +74,15 @@ enum Commands {
         #[arg(long, default_value = "verified")]
         mode: String,
     },
-    /// Start or stop a named observation run that records layouts and taps under .minimap/runs/.
-    Observe {
-        #[command(subcommand)]
-        command: ObserveCommand,
-    },
-    /// Stage a learned graph proposal (screens, edges, route) from the current observation run; requires --from-current-run --stage.
-    Learn {
-        #[arg(long)]
-        from_current_run: bool,
-        #[arg(long)]
-        stage: bool,
-    },
-    /// Resolve the planned navigation path to a screen or route from the current screen (no device action).
+    /// Manage routes: resolve a planned path or define a new route.
     Route {
-        target: String,
-        #[arg(long)]
-        current_screen: Option<String>,
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
+    /// Manage screens in the committed graph.
+    Screen {
+        #[command(subcommand)]
+        command: ScreenCommand,
     },
     /// Resolve and execute a route to the target, verifying each step and aborting on drift.
     Go {
@@ -89,15 +92,9 @@ enum Commands {
         #[arg(long, default_value = "verified")]
         mode: String,
     },
-    /// Match the current Android screen against the committed graph, or check a named screen's context guard.
-    Check {
-        #[arg(long)]
-        current: bool,
-        screen: Option<String>,
-    },
     /// Compare the current app state to the committed graph; stages a review proposal if drifted.
     Drift,
-    /// Validate routes against the live device; --all, --changed-files <path>, or --execute --current-screen <name> for live runs.
+    /// Validate routes against the live device; --all, --changed-files <path>, --execute --current-screen <name>, or --screen current.
     Validate {
         #[arg(long)]
         all: bool,
@@ -107,34 +104,39 @@ enum Commands {
         execute: bool,
         #[arg(long)]
         current_screen: Option<String>,
+        #[arg(long)]
+        screen: Option<String>,
     },
-    /// Stage a proposal to repair a drifted graph object (selector, screen, edge); requires --stage.
-    Repair {
-        target: String,
-        #[arg(long)]
-        stage: bool,
-    },
-    /// Bounded first-run discovery loop; requires --discover <name> --stage. Pass --finish to stop the run and stage the learned proposal.
-    Map {
-        #[arg(long)]
-        discover: Option<String>,
-        #[arg(long = "max-actions", default_value_t = 10)]
-        max_actions: usize,
-        #[arg(long)]
-        stage: bool,
-        #[arg(long)]
-        finish: bool,
-    },
-    /// Accept a staged proposal by id; the only command that mutates the committed graph.
+    /// Accept a staged proposal by id; the only command that mutates the committed graph through the review path.
     Accept { proposal_id: String },
+    /// Discard uncommitted changes to .minimap/graph and .minimap/routes via git checkout.
+    Undo,
 }
 
 #[derive(Debug, Subcommand)]
-enum ObserveCommand {
-    /// Begin a named observation run; subsequent layout and tap calls record into it.
-    Start { name: String },
-    /// Stop the active observation run and finalize its artifacts under .minimap/runs/.
-    Stop,
+enum RouteCommand {
+    /// Resolve the planned navigation path to a screen or route from the current screen (no device action).
+    Resolve {
+        target: String,
+        #[arg(long)]
+        current_screen: Option<String>,
+    },
+    /// Define a new route from --from screen to --to screen with optional triggers.
+    Define {
+        name: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long = "triggers")]
+        triggers: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScreenCommand {
+    /// Rewrite the `name` field on a screen JSON; edges are untouched.
+    Rename { id: String, new_name: String },
 }
 
 fn main() {
@@ -159,7 +161,23 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let root = PathBuf::from(".");
     match cli.command {
-        Commands::Init { dry_run, agents } => {
+        Commands::Init {
+            dry_run,
+            agents,
+            force,
+        } => {
+            if !force {
+                let legacy = detect_legacy_minimap(&root);
+                if !legacy.is_empty() {
+                    print_json(&json!({
+                        "schema_version": RESULT_SCHEMA_VERSION,
+                        "status": "config_error",
+                        "summary": LEGACY_MINIMAP_MESSAGE,
+                        "legacy_paths": legacy,
+                    }));
+                    return Ok(2);
+                }
+            }
             let result = run_init(&root, dry_run, &agents)?;
             print_json(&serde_json::to_value(result)?);
             Ok(0)
@@ -176,12 +194,6 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Layout { diff } => {
             let mut android = AndroidCli::new(SubprocessRunner);
             let result = layout_result(&mut android, diff)?;
-            let kind = if diff {
-                "android_layout_diff"
-            } else {
-                "android_layout"
-            };
-            record_observation_event(&root, kind, result["layout"].clone())?;
             print_json(&result);
             Ok(0)
         }
@@ -192,80 +204,30 @@ fn run(cli: Cli) -> Result<i32> {
             screenshot,
             reason,
             mode,
-        } => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
-            let result = if let Some(selector) = selector {
-                tap_selector_result(&mut android, &mut adb, &selector, reason.as_deref())?
-            } else if let Some(point) = point {
-                let (x, y) = parse_point(&point)?;
-                tap_point_result(&mut adb, x, y, &mode)?
-            } else if let Some(label) = label {
-                let screenshot = screenshot
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--label requires --screenshot"))?;
-                tap_label_result(&mut android, &mut adb, label, screenshot)?
-            } else {
-                anyhow::bail!("tap requires --selector, --point, or --label");
-            };
-            record_action_event(&root, "tap", result["action"].clone(), reason.as_deref())?;
-            print_json(&result);
-            Ok(0)
-        }
-        Commands::Observe { command } => match command {
-            ObserveCommand::Start { name } => {
-                let run = observe_start(&root, &name)?;
-                print_json(&json!({
-                    "schema_version": RESULT_SCHEMA_VERSION,
-                    "status": "ok",
-                    "summary": "observation started",
-                    "run": run
-                }));
-                Ok(0)
+        } => tap_atomic(&root, selector, point, label, screenshot, reason, &mode),
+        Commands::Route { command } => match command {
+            RouteCommand::Resolve {
+                target,
+                current_screen,
+            } => {
+                let graph = load_graph(&root)?;
+                let context = load_context(&root);
+                let plan = resolve_route(&graph, &target, current_screen.as_deref(), &context);
+                let result = plan.to_result();
+                let code = exit_code_for_status(&result.status);
+                print_json(&serde_json::to_value(result)?);
+                Ok(code)
             }
-            ObserveCommand::Stop => {
-                let run = observe_stop(&root)?;
-                print_json(&json!({
-                    "schema_version": RESULT_SCHEMA_VERSION,
-                    "status": "ok",
-                    "summary": "observation stopped",
-                    "run": run
-                }));
-                Ok(0)
-            }
+            RouteCommand::Define {
+                name,
+                to,
+                from,
+                triggers,
+            } => route_define(&root, &name, &to, from.as_deref(), &triggers),
         },
-        Commands::Learn {
-            from_current_run,
-            stage,
-        } => {
-            if !from_current_run || !stage {
-                anyhow::bail!("learn currently requires --from-current-run --stage");
-            }
-            let (proposal_id, path, metadata) = stage_learned_or_review_proposal(&root)?;
-            print_json(&json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "changed_requires_review",
-                "summary": "staged observation run review proposal",
-                "proposal_id": proposal_id,
-                "proposal_path": path.display().to_string(),
-                "raw_artifact_paths": [metadata.path],
-                "human_approval_required": true,
-                "recommended_next_command": format!("minimap accept {proposal_id} --json")
-            }));
-            Ok(1)
-        }
-        Commands::Route {
-            target,
-            current_screen,
-        } => {
-            let graph = load_graph(&root)?;
-            let context = load_context(&root);
-            let plan = resolve_route(&graph, &target, current_screen.as_deref(), &context);
-            let result = plan.to_result();
-            let code = exit_code_for_status(&result.status);
-            print_json(&serde_json::to_value(result)?);
-            Ok(code)
-        }
+        Commands::Screen { command } => match command {
+            ScreenCommand::Rename { id, new_name } => screen_rename(&root, &id, &new_name),
+        },
         Commands::Go {
             target,
             current_screen,
@@ -287,62 +249,6 @@ fn run(cli: Cli) -> Result<i32> {
             print_json(&result);
             Ok(code)
         }
-        Commands::Check { current, screen } => {
-            if current {
-                let mut android = AndroidCli::new(SubprocessRunner);
-                let result = match_current_screen(&root, &mut android)?;
-                print_json(&json!({
-                    "schema_version": RESULT_SCHEMA_VERSION,
-                    "status": "ok",
-                    "current_screen": result["current_screen"],
-                    "metrics": result["metrics"],
-                    "layout_observed": result["layout_observed"]
-                }));
-                Ok(0)
-            } else if let Some(name) = screen {
-                let graph = load_graph(&root)?;
-                let found = graph.screens.values().find(|candidate| {
-                    candidate.id == name
-                        || candidate.name == name
-                        || candidate.aliases.iter().any(|alias| alias == &name)
-                });
-                if let Some(screen) = found {
-                    let context = load_context(&root);
-                    let mismatches = context.mismatches(&screen.context_guard);
-                    if mismatches.is_empty() {
-                        print_json(&json!({
-                            "schema_version": RESULT_SCHEMA_VERSION,
-                            "status": "ok",
-                            "summary": format!("screen guard check for {}", screen.name),
-                            "data": {"screen": screen.name}
-                        }));
-                        Ok(0)
-                    } else {
-                        let result = minimap_schemas::MinimapResult::context_mismatch(mismatches);
-                        print_json(&serde_json::to_value(result)?);
-                        Ok(8)
-                    }
-                } else {
-                    print_json(&json!({
-                        "schema_version": RESULT_SCHEMA_VERSION,
-                        "status": "screen_unknown",
-                        "summary": format!("screen not found: {name}")
-                    }));
-                    Ok(5)
-                }
-            } else {
-                let mut android = AndroidCli::new(SubprocessRunner);
-                let result = match_current_screen(&root, &mut android)?;
-                print_json(&json!({
-                    "schema_version": RESULT_SCHEMA_VERSION,
-                    "status": "ok",
-                    "current_screen": result["current_screen"],
-                    "metrics": result["metrics"],
-                    "layout_observed": result["layout_observed"]
-                }));
-                Ok(0)
-            }
-        }
         Commands::Drift => {
             let mut android = AndroidCli::new(SubprocessRunner);
             let result = drift_result(&root, &mut android)?;
@@ -355,7 +261,12 @@ fn run(cli: Cli) -> Result<i32> {
             changed_files,
             execute,
             current_screen,
+            screen,
         } => {
+            if let Some(screen) = screen {
+                let mut android = AndroidCli::new(SubprocessRunner);
+                return validate_screen(&root, &mut android, &screen);
+            }
             let mut android = AndroidCli::new(SubprocessRunner);
             let mut adb = Adb::new(SubprocessRunner);
             let result = validate_result(
@@ -371,50 +282,6 @@ fn run(cli: Cli) -> Result<i32> {
             print_json(&result);
             Ok(code)
         }
-        Commands::Repair { target, stage } => {
-            if !stage {
-                anyhow::bail!("repair currently requires --stage");
-            }
-            let proposal = json!({
-                "schema_version": "minimap.proposal.v1",
-                "id": format!("proposal-repair-{}", target.replace('/', "_")),
-                "kind": "selector_drift",
-                "reason": format!("Review and repair Minimap graph object {target}."),
-                "changes": []
-            });
-            let path = stage_proposal_value(&root, &proposal)?;
-            print_json(&json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "changed_requires_review",
-                "summary": "staged repair proposal",
-                "proposal_id": proposal["id"],
-                "proposal_path": path.display().to_string(),
-                "human_approval_required": true
-            }));
-            Ok(1)
-        }
-        Commands::Map {
-            discover,
-            max_actions,
-            stage,
-            finish,
-        } => {
-            let target =
-                discover.ok_or_else(|| anyhow::anyhow!("map requires --discover <name>"))?;
-            if !stage {
-                anyhow::bail!("map --discover currently requires --stage");
-            }
-            let result = map_discover_result(&root, &target, max_actions, finish)?;
-            let code = if result["status"] == "budget_exhausted" {
-                1
-            } else if result["status"] == "needs_agent_action" {
-                0
-            } else {
-                exit_code_for_status(result["status"].as_str().unwrap_or("ok"))
-            };
-            print_json(&result);
-            Ok(code)
-        }
         Commands::Accept { proposal_id } => {
             let written = accept_proposal(&root, &proposal_id)?;
             print_json(&json!({
@@ -425,6 +292,479 @@ fn run(cli: Cli) -> Result<i32> {
             }));
             Ok(0)
         }
+        Commands::Undo => undo(&root),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TapAction {
+    Selector {
+        selector: String,
+    },
+    Label {
+        label: i64,
+        screenshot: String,
+    },
+    Point {
+        x: i64,
+        y: i64,
+        mode: String,
+    },
+}
+
+enum StepOutcome {
+    Matched {
+        to_screen_id: String,
+        edge_id: String,
+    },
+    NewScreen {
+        to_screen_id: String,
+        edge_id: String,
+    },
+    DriftStaged {
+        proposal_id: String,
+        candidate_screen_id: Option<String>,
+    },
+}
+
+fn tap_atomic(
+    root: &Path,
+    selector: Option<String>,
+    point: Option<String>,
+    label: Option<i64>,
+    screenshot: Option<String>,
+    reason: Option<String>,
+    mode: &str,
+) -> Result<i32> {
+    let action = match (selector, point, label) {
+        (Some(selector), None, None) => TapAction::Selector { selector },
+        (None, Some(point), None) => {
+            let (x, y) = parse_point(&point)?;
+            TapAction::Point {
+                x,
+                y,
+                mode: mode.to_string(),
+            }
+        }
+        (None, None, Some(label)) => {
+            let screenshot = screenshot
+                .ok_or_else(|| anyhow::anyhow!("--label requires --screenshot"))?;
+            TapAction::Label { label, screenshot }
+        }
+        (None, None, None) => anyhow::bail!("tap requires --selector, --point, or --label"),
+        _ => anyhow::bail!("tap accepts exactly one of --selector, --point, --label"),
+    };
+
+    let mut android = AndroidCli::new(SubprocessRunner);
+    let mut adb = Adb::new(SubprocessRunner);
+
+    // Pre-tap layout → classify from_screen.
+    let pre = layout_result(&mut android, false)?;
+    let pre_layout = pre["layout"].clone();
+    let from_screen_id = classify_screen_id(root, &pre_layout)?;
+
+    // Execute the tap. On failure: journal as tap_failed, exit 2.
+    let tap_result = match &action {
+        TapAction::Selector { selector } => {
+            tap_selector_result(&mut android, &mut adb, selector, reason.as_deref())
+        }
+        TapAction::Point { x, y, mode } => tap_point_result(&mut adb, *x, *y, mode),
+        TapAction::Label { label, screenshot } => {
+            tap_label_result(&mut android, &mut adb, *label, screenshot)
+        }
+    };
+    let tap_value = match tap_result {
+        Ok(value) => value,
+        Err(error) => {
+            append_journal_entry(
+                root,
+                &journal_entry(from_screen_id.clone(), None, None, reason.as_deref(), "tap_failed"),
+            )?;
+            print_json(&json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "tap_failed",
+                "summary": error.to_string(),
+                "from_screen_id": from_screen_id,
+                "outcome": "tap_failed",
+            }));
+            return Ok(2);
+        }
+    };
+
+    // Coordinate path: journal only, never grow the graph (selector unknown).
+    if let TapAction::Point { x, y, .. } = &action {
+        append_journal_entry(
+            root,
+            &journal_entry(
+                from_screen_id.clone(),
+                None,
+                None,
+                reason.as_deref(),
+                "coord_journal_only",
+            ),
+        )?;
+        print_json(&json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "ok",
+            "summary": "tap recorded; no edge added — use --selector or --label to grow the graph",
+            "from_screen_id": from_screen_id,
+            "action": tap_value["action"],
+            "outcome": "coord_journal_only",
+            "point": {"x": x, "y": y},
+        }));
+        return Ok(0);
+    }
+
+    // Post-tap settle + re-query layout.
+    thread::sleep(Duration::from_millis(POST_TAP_SETTLE_MS));
+    let post = layout_result(&mut android, false)?;
+    let post_layout = post["layout"].clone();
+
+    // Unknown from-screen → execute and journal but cannot grow the graph from an unanchored source.
+    let Some(from_id) = from_screen_id.clone() else {
+        append_journal_entry(
+            root,
+            &journal_entry(
+                None,
+                None,
+                None,
+                reason.as_deref(),
+                "from_screen_unknown",
+            ),
+        )?;
+        print_json(&json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "ok",
+            "summary": "tap recorded; no edge added — current screen unknown to the graph",
+            "from_screen_id": Value::Null,
+            "action": tap_value["action"],
+            "outcome": "from_screen_unknown",
+        }));
+        return Ok(0);
+    };
+
+    // Selector / label path: commit_step decides match / new / drift.
+    let outcome = commit_step(root, &from_id, &action, &post_layout, reason.as_deref())?;
+    match outcome {
+        StepOutcome::Matched {
+            to_screen_id,
+            edge_id,
+        } => {
+            append_journal_entry(
+                root,
+                &journal_entry(
+                    Some(from_id.clone()),
+                    Some(edge_id.clone()),
+                    Some(to_screen_id.clone()),
+                    reason.as_deref(),
+                    "matched",
+                ),
+            )?;
+            print_json(&json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "ok",
+                "summary": "tap matched an existing screen; edge recorded",
+                "from_screen_id": from_id,
+                "to_screen_id": to_screen_id,
+                "edge_id": edge_id,
+                "action": tap_value["action"],
+                "outcome": "matched",
+            }));
+            Ok(0)
+        }
+        StepOutcome::NewScreen {
+            to_screen_id,
+            edge_id,
+        } => {
+            append_journal_entry(
+                root,
+                &journal_entry(
+                    Some(from_id.clone()),
+                    Some(edge_id.clone()),
+                    Some(to_screen_id.clone()),
+                    reason.as_deref(),
+                    "new_screen",
+                ),
+            )?;
+            print_json(&json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "ok",
+                "summary": "tap reached a new screen; screen and edge committed",
+                "from_screen_id": from_id,
+                "to_screen_id": to_screen_id,
+                "edge_id": edge_id,
+                "action": tap_value["action"],
+                "outcome": "new_screen",
+            }));
+            Ok(0)
+        }
+        StepOutcome::DriftStaged {
+            proposal_id,
+            candidate_screen_id,
+        } => {
+            append_journal_entry(
+                root,
+                &journal_entry(
+                    Some(from_id.clone()),
+                    None,
+                    candidate_screen_id.clone(),
+                    reason.as_deref(),
+                    "drift_staged",
+                ),
+            )?;
+            print_json(&json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "changed_requires_review",
+                "summary": "tap landed on a drift candidate; staged proposal for review",
+                "from_screen_id": from_id,
+                "candidate_screen_id": candidate_screen_id,
+                "proposal_id": proposal_id,
+                "action": tap_value["action"],
+                "outcome": "drift_staged",
+                "human_approval_required": true,
+            }));
+            Ok(1)
+        }
+    }
+}
+
+/// Resolve the current screen ID by matching the pre-tap layout against the committed graph.
+/// Returns `None` when the layout is `screen_unknown` (no anchor for edge growth).
+fn classify_screen_id(root: &Path, layout: &Value) -> Result<Option<String>> {
+    let graph = load_graph(root)?;
+    let normalized = normalize_layout(layout);
+    let result = match_screen(&normalized, graph.screens.into_values());
+    match result.status.as_str() {
+        "matched" | "repair_candidate" => Ok(result.matched_screen),
+        _ => Ok(None),
+    }
+}
+
+/// Classify a post-tap layout and either auto-commit (match / new) or stage a drift proposal.
+fn commit_step(
+    root: &Path,
+    from_screen_id: &str,
+    action: &TapAction,
+    post_tap_layout: &Value,
+    reason: Option<&str>,
+) -> Result<StepOutcome> {
+    let normalized = normalize_layout(post_tap_layout);
+    let hash = identity_hash(&normalized);
+    let graph = load_graph(root)?;
+    let match_result = match_screen(&normalized, graph.screens.values().cloned());
+
+    let selector_candidates = selector_candidates_for_action(action);
+
+    match match_result.status.as_str() {
+        "matched" => {
+            let to_screen_id = match_result
+                .matched_screen
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("matched without screen id"))?;
+            let edge_id = edge_id_for(from_screen_id, &to_screen_id, &hash);
+            let edge = build_edge_value(
+                &edge_id,
+                from_screen_id,
+                &to_screen_id,
+                &selector_candidates,
+                reason,
+            );
+            commit_edge(root, &edge)?;
+            Ok(StepOutcome::Matched {
+                to_screen_id,
+                edge_id,
+            })
+        }
+        "repair_candidate" => {
+            let candidate = match_result.matched_screen.clone();
+            let proposal_id = format!("proposal-drift-{}", &hash[7..15.min(hash.len())]);
+            let proposal = json!({
+                "schema_version": "minimap.proposal.v1",
+                "id": proposal_id.clone(),
+                "kind": "selector_drift",
+                "reason": "Post-tap layout is similar but below match threshold; review the drift.",
+                "candidate_screen_id": candidate,
+                "from_screen_id": from_screen_id,
+                "match_confidence": match_result.match_confidence,
+                "identity_hash": hash,
+                "observed_layout": post_tap_layout,
+                "observed_normalized": normalized,
+                "selector_candidates": selector_candidates,
+                "tap_reason": reason,
+                "changes": []
+            });
+            stage_proposal_value(root, &proposal)?;
+            Ok(StepOutcome::DriftStaged {
+                proposal_id,
+                candidate_screen_id: candidate,
+            })
+        }
+        _ => {
+            // screen_unknown — commit a new screen + edge.
+            let to_screen_id = new_screen_id(&hash);
+            let name = derive_screen_name(post_tap_layout, &to_screen_id);
+            let screen = json!({
+                "schema_version": "minimap.screen.v1",
+                "id": to_screen_id.clone(),
+                "name": name,
+                "identity_hash": hash.clone(),
+                "normalized": normalized,
+                "aliases": []
+            });
+            commit_screen(root, &screen)?;
+            let edge_id = edge_id_for(from_screen_id, &to_screen_id, &hash);
+            let edge = build_edge_value(
+                &edge_id,
+                from_screen_id,
+                &to_screen_id,
+                &selector_candidates,
+                reason,
+            );
+            commit_edge(root, &edge)?;
+            Ok(StepOutcome::NewScreen {
+                to_screen_id,
+                edge_id,
+            })
+        }
+    }
+}
+
+fn selector_candidates_for_action(action: &TapAction) -> Vec<Value> {
+    match action {
+        TapAction::Selector { selector } => {
+            let (kind, value) = selector
+                .split_once('=')
+                .map(|(kind, value)| (kind.to_string(), value.to_string()))
+                .unwrap_or_else(|| ("selector".to_string(), selector.to_string()));
+            vec![json!({
+                "kind": kind,
+                "value": value,
+                "score": 0.7
+            })]
+        }
+        TapAction::Label { label, .. } => vec![json!({
+            "kind": "annotated_screenshot_label",
+            "value": label.to_string(),
+            "score": 0.3
+        })],
+        TapAction::Point { .. } => Vec::new(),
+    }
+}
+
+fn build_edge_value(
+    edge_id: &str,
+    from_screen_id: &str,
+    to_screen_id: &str,
+    selector_candidates: &[Value],
+    reason: Option<&str>,
+) -> Value {
+    json!({
+        "schema_version": "minimap.edge.v1",
+        "id": edge_id,
+        "from_screen": from_screen_id,
+        "to_screen": to_screen_id,
+        "intent": reason.unwrap_or("learned tap"),
+        "action": {
+            "kind": "tap",
+            "description": reason.unwrap_or("learned tap"),
+            "selector_candidates": selector_candidates
+        },
+        "expectations": [{"kind": "screen_reached", "screen": to_screen_id}],
+        "learned_from": {"source": "atomic_tap"}
+    })
+}
+
+fn new_screen_id(identity_hash: &str) -> String {
+    // identity_hash format: "sha256:<hex>". Take first 8 hex chars after the prefix.
+    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
+    let suffix: String = hex.chars().take(8).collect();
+    format!("screen_{suffix}")
+}
+
+fn edge_id_for(from_screen_id: &str, to_screen_id: &str, identity_hash: &str) -> String {
+    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
+    let suffix: String = hex.chars().take(8).collect();
+    format!("edge_{from_screen_id}__{to_screen_id}__{suffix}")
+}
+
+fn derive_screen_name(layout: &Value, fallback_id: &str) -> String {
+    if let Some(name) = walk_first_string(layout, &["contentDescription", "content_description"]) {
+        return name;
+    }
+    if let Some(text) = walk_first_text(layout) {
+        return text;
+    }
+    fallback_id.to_string()
+}
+
+fn walk_first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    if let Value::Object(map) = value {
+        for key in keys {
+            if let Some(Value::String(text)) = map.get(*key) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        for (_, child) in map {
+            if let Some(found) = walk_first_string(child, keys) {
+                return Some(found);
+            }
+        }
+    } else if let Value::Array(values) = value {
+        for child in values {
+            if let Some(found) = walk_first_string(child, keys) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn walk_first_text(value: &Value) -> Option<String> {
+    if let Value::Object(map) = value {
+        for key in ["text", "label", "title"] {
+            if let Some(Value::String(text)) = map.get(key) {
+                let trimmed = text.trim();
+                if trimmed.len() >= 2 && !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        for (_, child) in map {
+            if let Some(found) = walk_first_text(child) {
+                return Some(found);
+            }
+        }
+    } else if let Value::Array(values) = value {
+        for child in values {
+            if let Some(found) = walk_first_text(child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn journal_entry(
+    from_screen_id: Option<String>,
+    edge_id: Option<String>,
+    to_screen_id: Option<String>,
+    reason: Option<&str>,
+    outcome: &str,
+) -> JournalEntry {
+    JournalEntry {
+        schema_version: JOURNAL_ENTRY_SCHEMA_VERSION.to_string(),
+        ts: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0),
+        from_screen_id,
+        edge_id,
+        to_screen_id,
+        reason: reason.map(str::to_string),
+        outcome: outcome.to_string(),
     }
 }
 
@@ -433,169 +773,6 @@ fn parse_point(point: &str) -> Result<(i64, i64)> {
         .split_once(',')
         .ok_or_else(|| anyhow::anyhow!("--point must be X,Y"))?;
     Ok((x.trim().parse()?, y.trim().parse()?))
-}
-
-fn stage_learned_or_review_proposal(
-    root: &Path,
-) -> Result<(String, PathBuf, minimap_repo::ObservationMetadata)> {
-    let Some(metadata) = observe_current_or_latest(root)? else {
-        anyhow::bail!("No observation run available");
-    };
-    if let Some(proposal) = learned_proposal_for_run(root, &metadata)? {
-        let proposal_id = proposal["id"]
-            .as_str()
-            .unwrap_or("proposal-learned")
-            .to_string();
-        let path = stage_proposal_value(root, &proposal)?;
-        Ok((proposal_id, path, metadata))
-    } else {
-        stage_observation_review_proposal(root)
-    }
-}
-
-fn learned_proposal_for_run(
-    root: &Path,
-    metadata: &minimap_repo::ObservationMetadata,
-) -> Result<Option<serde_json::Value>> {
-    let run_path = PathBuf::from(&metadata.path);
-    let observations = read_json(&run_path.join("observations.json"))?;
-    let actions = read_json(&run_path.join("actions.json"))?;
-    let observation_values = observations.as_array().cloned().unwrap_or_default();
-    let action_values = actions.as_array().cloned().unwrap_or_default();
-    if observation_values.len() < 2 || action_values.is_empty() {
-        return Ok(None);
-    }
-    let transition_count = std::cmp::min(action_values.len(), observation_values.len() - 1);
-    if transition_count == 0 {
-        return Ok(None);
-    }
-    if action_values
-        .iter()
-        .take(transition_count)
-        .any(|action| action["payload"]["selector"].as_str().is_none())
-    {
-        return Ok(None);
-    }
-
-    let graph = load_graph(root)?;
-    let run_slug = slug_for_id(&metadata.name);
-    let mut changes = Vec::new();
-    let mut screen_names = Vec::new();
-    for (index, observation) in observation_values
-        .iter()
-        .enumerate()
-        .take(transition_count + 1)
-    {
-        let layout = observation["payload"].clone();
-        let normalized = normalize_layout(&layout);
-        let matched = match_screen(&normalized, graph.screens.values().cloned());
-        if matched.status == "matched" {
-            if let Some(name) = matched.matched_screen {
-                screen_names.push(name);
-                continue;
-            }
-        }
-        let (id, name) =
-            learned_screen_id_and_name(&run_slug, &metadata.name, index, transition_count);
-        screen_names.push(name.clone());
-        changes.push(json!({
-            "op": "add",
-            "object": {
-                "schema_version": "minimap.screen.v1",
-                "id": id,
-                "name": name,
-                "identity_hash": identity_hash(&normalized),
-                "normalized": normalized,
-                "aliases": []
-            }
-        }));
-    }
-
-    let mut edge_ids = Vec::new();
-    for index in 0..transition_count {
-        let action = action_values[index]["payload"].clone();
-        let selector = action["selector"].as_str().unwrap_or_default();
-        let (selector_kind, selector_value) = selector
-            .split_once('=')
-            .map(|(kind, value)| (kind.to_string(), value.to_string()))
-            .unwrap_or_else(|| ("selector".to_string(), selector.to_string()));
-        let edge_id = format!("edge_{}_{}__{}", run_slug, index, index + 1);
-        edge_ids.push(edge_id.clone());
-        changes.push(json!({
-            "op": "add",
-            "object": {
-                "schema_version": "minimap.edge.v1",
-                "id": edge_id,
-                "from_screen": screen_names[index],
-                "to_screen": screen_names[index + 1],
-                "intent": format!("navigate to {}", metadata.name),
-                "action": {
-                    "kind": "tap",
-                    "description": action["reason"].as_str().unwrap_or("learned tap"),
-                    "selector_candidates": [{
-                        "kind": selector_kind,
-                        "value": selector_value,
-                        "score": 0.7
-                    }]
-                },
-                "expectations": [{"kind": "screen_reached", "screen": screen_names[index + 1]}],
-                "learned_from": {"source": "observation_run", "run_id": metadata.run_id, "step": index}
-            }
-        }));
-    }
-
-    let route = json!({
-        "schema_version": "minimap.route.v1",
-        "name": metadata.name,
-        "start": {"screen": screen_names.first().cloned().unwrap_or_else(|| format!("{}-start", run_slug))},
-        "target": {"screen": screen_names.last().cloned().unwrap_or_else(|| metadata.name.clone())},
-        "preferred_edge_ids": edge_ids,
-        "allow_graph_fallback": true
-    });
-    changes.push(json!({"op": "add", "object": route}));
-
-    Ok(Some(json!({
-        "schema_version": "minimap.proposal.v1",
-        "id": format!("proposal-learn-{}", metadata.run_id),
-        "kind": "learned_route",
-        "reason": "Learn screens, edges, and route objects from an observation run.",
-        "changes": changes
-    })))
-}
-
-fn learned_screen_id_and_name(
-    run_slug: &str,
-    route_name: &str,
-    index: usize,
-    final_index: usize,
-) -> (String, String) {
-    if index == 0 {
-        (
-            format!("screen_{}_start", run_slug),
-            format!("{}-start", run_slug),
-        )
-    } else if index == final_index {
-        (format!("screen_{}", run_slug), route_name.to_string())
-    } else {
-        (
-            format!("screen_{}_step_{}", run_slug, index + 1),
-            format!("{}-step-{}", run_slug, index + 1),
-        )
-    }
-}
-
-fn slug_for_id(value: &str) -> String {
-    let slug: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    slug.trim_matches('_').to_string()
 }
 
 fn match_current_screen<R: CommandRunner>(
@@ -653,7 +830,6 @@ fn execute_route_plan<AR: CommandRunner, DR: CommandRunner>(
             .as_i64()
             .unwrap_or(0);
         let action = action_result["action"].clone();
-        record_action_event(root, "tap", action.clone(), edge.intent.as_deref())?;
         let verification = match_current_screen(root, android)?;
         layout_calls_total += verification["metrics"]["layout_calls_total"]
             .as_i64()
@@ -724,11 +900,11 @@ fn drift_result<R: CommandRunner>(
             let context = load_context(root);
             let matched = current_screen["matched_screen"].as_str();
             let mismatches = matched
-                .and_then(|screen_name| {
+                .and_then(|screen_id| {
                     graph
                         .screens
                         .values()
-                        .find(|screen| screen.name == screen_name)
+                        .find(|screen| screen.id == screen_id)
                         .map(|screen| context.mismatches(&screen.context_guard))
                 })
                 .unwrap_or_default();
@@ -817,11 +993,11 @@ fn validate_result<AR: CommandRunner, DR: CommandRunner>(
             skipped_routes.push(json!({"route": route_name, "reason": "current_screen_unknown"}));
             continue;
         };
-        if route.start_screen() != Some(screen) {
+        if route.from_screen() != Some(screen) {
             skipped_routes.push(json!({
                 "route": route_name,
                 "reason": "start_screen_mismatch",
-                "expected_start": route.start_screen(),
+                "expected_start": route.from_screen(),
                 "current_screen": screen
             }));
             continue;
@@ -871,99 +1047,6 @@ fn validate_result<AR: CommandRunner, DR: CommandRunner>(
     result["skipped_routes"] = json!(skipped_routes);
     result["final_screen"] = json!(active_screen);
     Ok(result)
-}
-
-fn map_discover_result(
-    root: &Path,
-    target: &str,
-    max_actions: usize,
-    finish: bool,
-) -> Result<serde_json::Value> {
-    if max_actions == 0 {
-        anyhow::bail!("--max-actions must be greater than zero");
-    }
-    if let Some(metadata) = observe_current(root)? {
-        if metadata.name != target {
-            anyhow::bail!(
-                "observation run {} is already active for {}",
-                metadata.run_id,
-                metadata.name
-            );
-        }
-        let action_count = observation_action_count(&metadata)?;
-        if finish {
-            let stopped = observe_stop(root)?;
-            let (proposal_id, path, _) = stage_learned_or_review_proposal(root)?;
-            return Ok(json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "changed_requires_review",
-                "summary": "finished discovery run and staged proposal",
-                "target": target,
-                "run": stopped,
-                "actions_recorded": action_count,
-                "max_actions": max_actions,
-                "proposal_id": proposal_id,
-                "proposal_path": path.display().to_string(),
-                "human_approval_required": true
-            }));
-        }
-        if action_count >= max_actions {
-            return Ok(json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "budget_exhausted",
-                "summary": "discovery action budget exhausted",
-                "target": target,
-                "run": metadata,
-                "actions_recorded": action_count,
-                "max_actions": max_actions,
-                "recommended_next_command": format!("minimap map --discover {target} --max-actions {max_actions} --stage --finish")
-            }));
-        }
-        return Ok(json!({
-            "schema_version": RESULT_SCHEMA_VERSION,
-            "status": "needs_agent_action",
-            "summary": "continue bounded discovery with minimap layout and minimap tap",
-            "target": target,
-            "run": metadata,
-            "actions_recorded": action_count,
-            "max_actions": max_actions,
-            "budget_remaining": max_actions - action_count,
-            "allowed_next_commands": [
-                "minimap layout",
-                "minimap tap --selector \"<kind>=<value>\" --reason \"<why>\"",
-                format!("minimap map --discover {target} --max-actions {max_actions} --stage --finish")
-            ]
-        }));
-    }
-
-    if finish {
-        anyhow::bail!("no active discovery run to finish");
-    }
-    let metadata = observe_start(root, target)?;
-    let mut android = AndroidCli::new(SubprocessRunner);
-    let layout = layout_result(&mut android, false)?;
-    record_observation_event(root, "android_layout", layout["layout"].clone())?;
-    Ok(json!({
-        "schema_version": RESULT_SCHEMA_VERSION,
-        "status": "needs_agent_action",
-        "summary": "started bounded discovery run",
-        "target": target,
-        "run": metadata,
-        "actions_recorded": 0,
-        "max_actions": max_actions,
-        "budget_remaining": max_actions,
-        "layout_observed": layout["layout"].is_object(),
-        "allowed_next_commands": [
-            "minimap layout",
-            "minimap tap --selector \"<kind>=<value>\" --reason \"<why>\"",
-            format!("minimap map --discover {target} --max-actions {max_actions} --stage --finish")
-        ]
-    }))
-}
-
-fn observation_action_count(metadata: &minimap_repo::ObservationMetadata) -> Result<usize> {
-    let actions = read_json(&PathBuf::from(&metadata.path).join("actions.json"))?;
-    Ok(actions.as_array().map(Vec::len).unwrap_or(0))
 }
 
 fn selected_routes_for_validation(
@@ -1022,19 +1105,24 @@ fn doctor(root: &std::path::Path) -> serde_json::Value {
         ".minimap/graph/screens",
         ".minimap/graph/edges",
         ".minimap/routes",
-        ".minimap/checks",
         ".minimap/proposals",
-        ".minimap/runs",
-        ".minimap/state",
     ]
     .iter()
     .all(|path| root.join(path).is_dir());
-    let checks = vec![
+    let journal_status = journal_writable_status(root);
+    let graph_tracked = graph_git_tracked_status(root);
+    let mut checks = vec![
         json!({"name": "config", "status": if config_exists { "pass" } else { "fail" }}),
         json!({"name": "graph_dirs", "status": if graph_dirs_exist { "pass" } else { "fail" }}),
+        json!({"name": "journal_writable", "status": journal_status}),
+        graph_tracked,
         json!({"name": "android_cli", "status": if command_on_path("android") { "pass" } else { "warn" }}),
         json!({"name": "adb", "status": if command_on_path("adb") { "pass" } else { "warn" }}),
     ];
+    let hint = checks
+        .iter()
+        .find(|check| check["name"] == "graph_tracked")
+        .and_then(|check| check.get("hint").cloned());
     let fail = checks
         .iter()
         .filter(|check| check["status"] == "fail")
@@ -1047,18 +1135,285 @@ fn doctor(root: &std::path::Path) -> serde_json::Value {
         .iter()
         .filter(|check| check["status"] == "pass")
         .count();
-    json!({
+    // Strip the helper `hint` field from individual check objects before serializing.
+    for check in &mut checks {
+        if let Value::Object(map) = check {
+            map.remove("hint");
+        }
+    }
+    let mut payload = json!({
         "ok": fail == 0,
         "root": root.canonicalize().unwrap_or_else(|_| root.to_path_buf()).display().to_string(),
         "summary": { "pass": pass, "warn": warn, "fail": fail },
         "checks": checks
-    })
+    });
+    if let Some(hint) = hint {
+        payload["hint"] = hint;
+    }
+    payload
+}
+
+fn journal_writable_status(root: &Path) -> &'static str {
+    let path = root.join(".minimap/journal.jsonl");
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return "not_writable";
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(_) => "ok",
+        Err(_) => "not_writable",
+    }
+}
+
+fn graph_git_tracked_status(root: &Path) -> Value {
+    if !is_inside_git_work_tree(root) {
+        return json!({
+            "name": "graph_tracked",
+            "status": "warn",
+            "detail": "not in a git work tree"
+        });
+    }
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", ".minimap/graph", ".minimap/routes"])
+        .output();
+    let tracked_count = match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count(),
+        _ => 0,
+    };
+    if tracked_count > 0 {
+        json!({
+            "name": "graph_tracked",
+            "status": "pass",
+            "tracked_files": tracked_count
+        })
+    } else {
+        json!({
+            "name": "graph_tracked",
+            "status": "warn",
+            "hint": "tip: `git add .minimap/graph .minimap/routes` to enable `minimap undo`"
+        })
+    }
 }
 
 fn command_on_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|path| path.join(name).exists()))
         .unwrap_or(false)
+}
+
+fn route_define(
+    root: &Path,
+    name: &str,
+    to: &str,
+    from: Option<&str>,
+    triggers: &[String],
+) -> Result<i32> {
+    if !screen_path(root, to).exists() {
+        anyhow::bail!(
+            "target screen '{to}' not found in .minimap/graph/screens — define the screen before the route"
+        );
+    }
+    if let Some(from_id) = from {
+        if !screen_path(root, from_id).exists() {
+            anyhow::bail!(
+                "from screen '{from_id}' not found in .minimap/graph/screens — define the screen before the route"
+            );
+        }
+    }
+    let expanded_triggers = expand_triggers(triggers);
+    let trigger_values: Vec<Value> = expanded_triggers
+        .iter()
+        .map(|trigger| Value::String(trigger.clone()))
+        .collect();
+    let mut route_value = json!({
+        "schema_version": ROUTE_SCHEMA_VERSION,
+        "name": name,
+        "target": { "screen": to },
+        "triggers": trigger_values,
+        "aliases": []
+    });
+    if let Some(from_id) = from {
+        route_value["from"] = json!({ "screen": from_id });
+    }
+    let path = commit_route(root, &route_value)?;
+    print_json(&json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": "ok",
+        "summary": format!(
+            "defined route '{name}': {} → {to}",
+            from.unwrap_or("(none)")
+        ),
+        "route_name": name,
+        "route_path": path.display().to_string(),
+        "from_screen": from,
+        "to_screen": to,
+        "triggers": expanded_triggers
+    }));
+    Ok(0)
+}
+
+fn expand_triggers(triggers: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in triggers {
+        for part in value.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn screen_rename(root: &Path, id: &str, new_name: &str) -> Result<i32> {
+    let renamed = rename_screen(root, id, new_name)?;
+    print_json(&json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": "ok",
+        "summary": format!("renamed {id}: {} → {new_name}", renamed.old_name),
+        "screen_id": id,
+        "old_name": renamed.old_name,
+        "new_name": new_name,
+        "screen_path": renamed.path.display().to_string()
+    }));
+    Ok(0)
+}
+
+fn undo(root: &Path) -> Result<i32> {
+    if !is_inside_git_work_tree(root) {
+        print_json(&json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "config_error",
+            "summary": "not a git repo — undo requires git; commit your graph regularly to enable rollback."
+        }));
+        return Ok(1);
+    }
+    let paths: Vec<&str> = [".minimap/graph", ".minimap/routes"]
+        .iter()
+        .copied()
+        .filter(|path| root.join(path).exists())
+        .collect();
+    if paths.is_empty() {
+        print_json(&json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "ok",
+            "summary": "nothing to undo",
+            "dropped": 0
+        }));
+        return Ok(0);
+    }
+    let mut status_args = vec!["status", "--porcelain", "--"];
+    status_args.extend(paths.iter().copied());
+    let porcelain = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(&status_args)
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to invoke git status: {error}"))?;
+    if !porcelain.status.success() {
+        let stderr = String::from_utf8_lossy(&porcelain.stderr).to_string();
+        anyhow::bail!("git status failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&porcelain.stdout);
+    let changed_count = stdout.lines().filter(|line| !line.is_empty()).count();
+    if changed_count == 0 {
+        print_json(&json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "ok",
+            "summary": "nothing to undo",
+            "dropped": 0
+        }));
+        return Ok(0);
+    }
+    let mut checkout_args = vec!["checkout", "--"];
+    checkout_args.extend(paths.iter().copied());
+    let checkout = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(&checkout_args)
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to invoke git checkout: {error}"))?;
+    if !checkout.status.success() {
+        let stderr = String::from_utf8_lossy(&checkout.stderr).to_string();
+        anyhow::bail!("git checkout failed: {}", stderr.trim());
+    }
+    print_json(&json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": "ok",
+        "summary": format!("dropped {changed_count} uncommitted graph changes"),
+        "dropped": changed_count
+    }));
+    Ok(0)
+}
+
+fn is_inside_git_work_tree(root: &Path) -> bool {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    match output {
+        Ok(output) => {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == "true"
+        }
+        Err(_) => false,
+    }
+}
+
+fn validate_screen<R: CommandRunner>(
+    root: &Path,
+    android: &mut AndroidCli<R>,
+    screen: &str,
+) -> Result<i32> {
+    if screen != "current" {
+        print_json(&json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "config_error",
+            "summary": "validate --screen <id> for a specific screen is not implemented; use --screen current",
+            "screen": screen
+        }));
+        return Ok(7);
+    }
+    let current = match_current_screen(root, android)?;
+    let current_screen = &current["current_screen"];
+    let status_in = current_screen["status"].as_str().unwrap_or("screen_unknown");
+    let (status_out, summary, code) = match status_in {
+        "matched" => (
+            "matched",
+            "current app state matches committed graph",
+            0,
+        ),
+        "repair_candidate" => (
+            "drift",
+            "current screen is similar but below match threshold",
+            1,
+        ),
+        _ => (
+            "unknown",
+            "current app state is not known in committed graph",
+            2,
+        ),
+    };
+    print_json(&json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": status_out,
+        "summary": summary,
+        "screen": "current",
+        "current_screen": current_screen,
+        "metrics": current["metrics"]
+    }));
+    Ok(code)
 }
 
 fn print_json(value: &serde_json::Value) {

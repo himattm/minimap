@@ -1,20 +1,20 @@
 use anyhow::{Context, Result};
 use minimap_schemas::{
-    canonical_json, GraphContext, NavigationEdge, Proposal, Route, ScreenNode,
+    canonical_json, GraphContext, JournalEntry, NavigationEdge, Proposal, Route, ScreenNode,
     CONFIG_SCHEMA_VERSION, EDGE_SCHEMA_VERSION, PROPOSAL_SCHEMA_VERSION, ROUTE_SCHEMA_VERSION,
     SCREEN_SCHEMA_VERSION,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_SKILL_NAME: &str = APP_NAVIGATION_SKILL_NAME;
 pub const APP_NAVIGATION_SKILL_NAME: &str = "minimap-app-navigation";
 pub const FIRST_RUN_MAPPING_SKILL_NAME: &str = "minimap-first-run-mapping";
-pub const GITIGNORE_ENTRIES: &[&str] = &[".minimap/runs/", ".minimap/state/"];
+pub const GITIGNORE_ENTRIES: &[&str] = &[".minimap/journal.jsonl"];
 
 pub const MINIMAP_DIRS: &[&str] = &[
     ".minimap",
@@ -22,11 +22,25 @@ pub const MINIMAP_DIRS: &[&str] = &[
     ".minimap/graph/screens",
     ".minimap/graph/edges",
     ".minimap/routes",
-    ".minimap/checks",
     ".minimap/proposals",
+];
+
+pub const LEGACY_MINIMAP_PATHS: &[&str] = &[
     ".minimap/runs",
     ".minimap/state",
+    ".minimap/checks",
+    ".minimap/current.json",
 ];
+
+pub const LEGACY_MINIMAP_MESSAGE: &str = "this project was initialized under minimap 0.1.x \u{2014} the on-disk layout has changed.\nplease remove `.minimap/` and re-run `minimap init`.\n\n(use `minimap init --force` to overwrite anyway.)\n(graph and routes from the old format are not migrated. see CHANGELOG.md for details.)";
+
+pub fn detect_legacy_minimap(root: &Path) -> Vec<String> {
+    LEGACY_MINIMAP_PATHS
+        .iter()
+        .filter(|path| root.join(path).exists())
+        .map(|path| path.to_string())
+        .collect()
+}
 
 pub const APP_NAVIGATION_SKILL_BODY: &str = r#"---
 name: minimap-app-navigation
@@ -174,8 +188,6 @@ pub fn default_config() -> Value {
         },
         "storage": {
             "commit_raw_layouts": false,
-            "runs_dir": ".minimap/runs",
-            "state_dir": ".minimap/state",
             "commit_runtime_telemetry": false,
             "generate_index_cache": true,
             "commit_index_cache": false
@@ -310,6 +322,17 @@ fn plan_init(root: &Path, skill_paths: &[String]) -> Vec<InitChange> {
         .to_string(),
         detail: String::new(),
     });
+    changes.push(InitChange {
+        kind: "journal".to_string(),
+        path: ".minimap/journal.jsonl".to_string(),
+        status: if root.join(".minimap/journal.jsonl").exists() {
+            "exists"
+        } else {
+            "create"
+        }
+        .to_string(),
+        detail: String::new(),
+    });
     let missing = missing_gitignore_entries(root);
     changes.push(InitChange {
         kind: "gitignore".to_string(),
@@ -348,6 +371,16 @@ fn apply_init(root: &Path, changes: &[InitChange]) -> Result<()> {
         match (change.kind.as_str(), change.status.as_str()) {
             ("directory", "create") => fs::create_dir_all(&path)?,
             ("config", "create") => write_json(&path, &default_config())?,
+            ("journal", "create") => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&path)?;
+            }
             ("gitignore", "append") => append_gitignore(root)?,
             ("skill", "create") => {
                 if let Some(parent) = path.parent() {
@@ -521,199 +554,83 @@ pub fn accept_proposal(root: &Path, id: &str) -> Result<Vec<PathBuf>> {
             .context("proposal change must include object")?;
         let schema = object.get("schema_version").and_then(Value::as_str);
         let path = match schema {
-            Some(SCREEN_SCHEMA_VERSION) => {
-                let screen: ScreenNode = serde_json::from_value(object.clone())?;
-                root.join(".minimap/graph/screens")
-                    .join(format!("{}.json", screen_filename(&screen.id)))
-            }
-            Some(EDGE_SCHEMA_VERSION) => {
-                let edge: NavigationEdge = serde_json::from_value(object.clone())?;
-                root.join(".minimap/graph/edges")
-                    .join(format!("{}.json", edge_filename(&edge.id)))
-            }
-            Some(ROUTE_SCHEMA_VERSION) => {
-                let route: Route = serde_json::from_value(object.clone())?;
-                root.join(".minimap/routes")
-                    .join(format!("{}.minimap.json", slugify(&route.name)))
-            }
+            Some(SCREEN_SCHEMA_VERSION) => commit_screen(root, object)?,
+            Some(EDGE_SCHEMA_VERSION) => commit_edge(root, object)?,
+            Some(ROUTE_SCHEMA_VERSION) => commit_route(root, object)?,
             other => anyhow::bail!("unsupported proposal object schema_version {other:?}"),
         };
-        write_json(&path, object)?;
         written.push(path);
     }
     Ok(written)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObservationMetadata {
-    pub schema_version: String,
-    pub run_id: String,
-    pub name: String,
-    pub path: String,
-    pub status: String,
-    pub started_at: String,
-    #[serde(default)]
-    pub stopped_at: Option<String>,
+pub fn commit_screen(root: &Path, screen: &Value) -> Result<PathBuf> {
+    let parsed: ScreenNode = serde_json::from_value(screen.clone())?;
+    let path = root
+        .join(".minimap/graph/screens")
+        .join(format!("{}.json", screen_filename(&parsed.id)));
+    write_json(&path, screen)?;
+    Ok(path)
 }
 
-pub fn observe_start(root: &Path, name: &str) -> Result<ObservationMetadata> {
-    let runs_dir = root.join(".minimap/runs");
-    fs::create_dir_all(&runs_dir)?;
-    let timestamp = unix_timestamp();
-    let run_id = format!("{timestamp}-{}", slugify(name));
-    let run_path = runs_dir.join(&run_id);
-    fs::create_dir_all(run_path.join("raw-layouts"))?;
-    fs::create_dir_all(run_path.join("layout-deltas"))?;
-    fs::create_dir_all(run_path.join("screenshots"))?;
-    let metadata = ObservationMetadata {
-        schema_version: "minimap.observation_run.v1".to_string(),
-        run_id: run_id.clone(),
-        name: name.to_string(),
-        path: run_path.display().to_string(),
-        status: "running".to_string(),
-        started_at: timestamp.to_string(),
-        stopped_at: None,
-    };
-    write_json(
-        &run_path.join("metadata.json"),
-        &serde_json::to_value(&metadata)?,
-    )?;
-    write_json(&run_path.join("actions.json"), &Value::Array(vec![]))?;
-    write_json(&run_path.join("observations.json"), &Value::Array(vec![]))?;
-    write_json(
-        &runs_dir.join("current.json"),
-        &json!({"schema_version": "minimap.current_run.v1", "run_id": run_id}),
-    )?;
-    Ok(metadata)
+pub fn commit_edge(root: &Path, edge: &Value) -> Result<PathBuf> {
+    let parsed: NavigationEdge = serde_json::from_value(edge.clone())?;
+    let path = root
+        .join(".minimap/graph/edges")
+        .join(format!("{}.json", edge_filename(&parsed.id)));
+    write_json(&path, edge)?;
+    Ok(path)
 }
 
-pub fn observe_current(root: &Path) -> Result<Option<ObservationMetadata>> {
-    let current_path = root.join(".minimap/runs/current.json");
-    if !current_path.exists() {
-        return Ok(None);
+pub fn commit_route(root: &Path, route: &Value) -> Result<PathBuf> {
+    let parsed: Route = serde_json::from_value(route.clone())?;
+    let path = root
+        .join(".minimap/routes")
+        .join(format!("{}.minimap.json", slugify(&parsed.name)));
+    write_json(&path, route)?;
+    Ok(path)
+}
+
+pub fn screen_path(root: &Path, screen_id: &str) -> PathBuf {
+    root.join(".minimap/graph/screens")
+        .join(format!("{}.json", screen_filename(screen_id)))
+}
+
+pub struct RenamedScreen {
+    pub path: PathBuf,
+    pub old_name: String,
+}
+
+pub fn rename_screen(root: &Path, screen_id: &str, new_name: &str) -> Result<RenamedScreen> {
+    let path = screen_path(root, screen_id);
+    if !path.exists() {
+        anyhow::bail!("screen '{screen_id}' not found at {}", path.display());
     }
-    let current = read_json(&current_path)?;
-    let Some(run_id) = current.get("run_id").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let metadata_path = root
-        .join(".minimap/runs")
-        .join(run_id)
-        .join("metadata.json");
-    if !metadata_path.exists() {
-        return Ok(None);
-    }
-    let metadata: ObservationMetadata = serde_json::from_value(read_json(&metadata_path)?)?;
-    if metadata.status == "running" {
-        Ok(Some(metadata))
+    let mut value = read_json(&path)?;
+    let old_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if let Value::Object(map) = &mut value {
+        map.insert("name".to_string(), Value::String(new_name.to_string()));
     } else {
-        Ok(None)
+        anyhow::bail!("screen file {} is not a JSON object", path.display());
     }
+    commit_screen(root, &value)?;
+    Ok(RenamedScreen { path, old_name })
 }
 
-pub fn observe_current_or_latest(root: &Path) -> Result<Option<ObservationMetadata>> {
-    if let Some(current) = observe_current(root)? {
-        return Ok(Some(current));
+pub fn append_journal_entry(root: &Path, entry: &JournalEntry) -> Result<()> {
+    let path = root.join(".minimap/journal.jsonl");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    let runs_dir = root.join(".minimap/runs");
-    if !runs_dir.exists() {
-        return Ok(None);
-    }
-    let mut metadata = Vec::new();
-    for entry in fs::read_dir(runs_dir)? {
-        let path = entry?.path();
-        let metadata_path = path.join("metadata.json");
-        if metadata_path.exists() {
-            let parsed: ObservationMetadata = serde_json::from_value(read_json(&metadata_path)?)?;
-            metadata.push(parsed);
-        }
-    }
-    metadata.sort_by(|left, right| left.started_at.cmp(&right.started_at));
-    Ok(metadata.pop())
-}
-
-pub fn observe_stop(root: &Path) -> Result<ObservationMetadata> {
-    let Some(mut metadata) = observe_current(root)? else {
-        anyhow::bail!("No current observation run");
-    };
-    metadata.status = "stopped".to_string();
-    metadata.stopped_at = Some(unix_timestamp().to_string());
-    let metadata_path = PathBuf::from(&metadata.path).join("metadata.json");
-    write_json(&metadata_path, &serde_json::to_value(&metadata)?)?;
-    let _ = fs::remove_file(root.join(".minimap/runs/current.json"));
-    Ok(metadata)
-}
-
-pub fn record_observation_event(root: &Path, kind: &str, payload: Value) -> Result<()> {
-    let Some(metadata) = observe_current(root)? else {
-        return Ok(());
-    };
-    append_event(
-        &PathBuf::from(metadata.path).join("observations.json"),
-        kind,
-        payload,
-    )
-}
-
-pub fn record_action_event(
-    root: &Path,
-    kind: &str,
-    payload: Value,
-    reason: Option<&str>,
-) -> Result<()> {
-    let Some(metadata) = observe_current(root)? else {
-        return Ok(());
-    };
-    let mut event_payload = payload;
-    if let Some(reason) = reason {
-        event_payload["reason"] = Value::String(reason.to_string());
-    }
-    append_event(
-        &PathBuf::from(metadata.path).join("actions.json"),
-        kind,
-        event_payload,
-    )
-}
-
-fn append_event(path: &Path, kind: &str, payload: Value) -> Result<()> {
-    let mut values = if path.exists() {
-        read_json(path)?.as_array().cloned().unwrap_or_default()
-    } else {
-        vec![]
-    };
-    values.push(json!({
-        "schema_version": "minimap.observation_event.v1",
-        "timestamp": unix_timestamp().to_string(),
-        "kind": kind,
-        "payload": payload
-    }));
-    write_json(path, &Value::Array(values))
-}
-
-pub fn stage_observation_review_proposal(
-    root: &Path,
-) -> Result<(String, PathBuf, ObservationMetadata)> {
-    let Some(metadata) = observe_current_or_latest(root)? else {
-        anyhow::bail!("No observation run available");
-    };
-    let proposal_id = format!("proposal-{}", metadata.run_id);
-    let proposal = json!({
-        "schema_version": PROPOSAL_SCHEMA_VERSION,
-        "id": proposal_id,
-        "kind": "observation_run_review",
-        "reason": "Review this observation run and convert stable navigation facts into graph objects.",
-        "changes": []
-    });
-    let path = proposal_path(root, proposal_id.as_str());
-    write_json(&path, &proposal)?;
-    Ok((proposal_id, path, metadata))
-}
-
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    let mut line = serde_json::to_string(entry)?;
+    line.push('\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    file.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 fn slugify(value: &str) -> String {
@@ -779,7 +696,9 @@ mod tests {
             .iter()
             .any(|change| change.path == ".minimap/config.json" && change.status == "exists"));
         let gitignore = fs::read_to_string(temp.path().join(".gitignore")).unwrap();
-        assert_eq!(gitignore.matches(".minimap/runs/").count(), 1);
+        assert_eq!(gitignore.matches(".minimap/journal.jsonl").count(), 1);
+        assert!(!gitignore.contains(".minimap/runs/"));
+        assert!(!gitignore.contains(".minimap/state/"));
     }
 
     #[test]

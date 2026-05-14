@@ -68,7 +68,7 @@ pub fn resolve_route(
     let start_screen = current_screen.map(str::to_string).or_else(|| {
         route
             .as_ref()
-            .and_then(Route::start_screen)
+            .and_then(Route::from_screen)
             .map(str::to_string)
     });
 
@@ -86,83 +86,8 @@ pub fn resolve_route(
         };
     };
 
-    if let Some(route) = &route {
-        let mismatches = context.mismatches(&route.combined_context_guard());
-        if !mismatches.is_empty() {
-            return RoutePlan {
-                status: "context_mismatch".to_string(),
-                target: target_screen,
-                start_screen: Some(start_screen),
-                route: Some(route.clone()),
-                edges: vec![],
-                preferred_path_used: false,
-                graph_fallback_used: false,
-                context_mismatches: mismatches,
-                reason: Some("route context guard mismatch".to_string()),
-            };
-        }
-
-        if !route.preferred_edge_ids.is_empty() {
-            let mut preferred = Vec::new();
-            let mut missing_or_mismatch = None;
-            for edge_id in &route.preferred_edge_ids {
-                match graph.edges.get(edge_id) {
-                    Some(edge) if context.satisfies(&edge.context_guard) => {
-                        preferred.push(edge.clone())
-                    }
-                    Some(edge) => {
-                        missing_or_mismatch = Some(context.mismatches(&edge.context_guard));
-                        break;
-                    }
-                    None => break,
-                }
-            }
-            if preferred.len() == route.preferred_edge_ids.len()
-                && preferred.last().map(|edge| edge.to_screen.as_str())
-                    == Some(target_screen.as_str())
-            {
-                return RoutePlan {
-                    status: "ok".to_string(),
-                    target: target_screen,
-                    start_screen: Some(start_screen),
-                    route: Some(route.clone()),
-                    edges: preferred,
-                    preferred_path_used: true,
-                    graph_fallback_used: false,
-                    context_mismatches: vec![],
-                    reason: None,
-                };
-            }
-            if let Some(mismatches) = missing_or_mismatch {
-                return RoutePlan {
-                    status: "context_mismatch".to_string(),
-                    target: target_screen,
-                    start_screen: Some(start_screen),
-                    route: Some(route.clone()),
-                    edges: vec![],
-                    preferred_path_used: false,
-                    graph_fallback_used: false,
-                    context_mismatches: mismatches,
-                    reason: Some("preferred path context guard mismatch".to_string()),
-                };
-            }
-            if !route.allow_graph_fallback {
-                return RoutePlan {
-                    status: "route_broken".to_string(),
-                    target: target_screen,
-                    start_screen: Some(start_screen),
-                    route: Some(route.clone()),
-                    edges: vec![],
-                    preferred_path_used: false,
-                    graph_fallback_used: false,
-                    context_mismatches: vec![],
-                    reason: Some(
-                        "preferred path unavailable and graph fallback disabled".to_string(),
-                    ),
-                };
-            }
-        }
-    }
+    // TODO(phase-2): wire up new Route shape (preferred edges, route guards, fallback toggle
+    // were dropped; path is always graph traversal now).
 
     let fallback = graph_fallback(&graph.edges, &start_screen, &target_screen, context);
     if let Some(edges) = fallback {
@@ -204,7 +129,6 @@ fn lookup_route(
                 .aliases
                 .iter()
                 .any(|alias| alias.to_lowercase() == needle)
-            || route.intent.as_ref().map(|intent| intent.to_lowercase()) == Some(needle.clone())
         {
             return Some(route.clone());
         }
@@ -226,7 +150,7 @@ fn find_target_screen(screens: &BTreeMap<String, ScreenNode>, target: &str) -> O
                 .iter()
                 .any(|alias| alias.to_lowercase() == needle)
         {
-            Some(screen.name.clone())
+            Some(screen.id.clone())
         } else {
             None
         }
@@ -326,11 +250,11 @@ mod tests {
             edges: BTreeMap::from([
                 (
                     "edge_home_feed".to_string(),
-                    edge("edge_home_feed", "home", "feed"),
+                    edge("edge_home_feed", "screen_home", "screen_feed"),
                 ),
                 (
                     "edge_feed_article".to_string(),
-                    edge("edge_feed_article", "feed", "article"),
+                    edge("edge_feed_article", "screen_feed", "screen_article"),
                 ),
             ]),
             routes: BTreeMap::from([(
@@ -338,23 +262,17 @@ mod tests {
                 Route {
                     schema_version: minimap_schemas::ROUTE_SCHEMA_VERSION.to_string(),
                     name: "read-article".to_string(),
-                    target: json!({"screen": "article"}),
-                    intent: None,
-                    start: json!({"screen": "home"}),
-                    preferred_edge_ids: vec!["missing".to_string()],
-                    allow_graph_fallback: true,
-                    path_constraints: Value::Null,
-                    checks: vec![],
+                    target: json!({"screen": "screen_article"}),
+                    from: Some(json!({"screen": "screen_home"})),
                     triggers: vec![],
                     aliases: vec![],
-                    context_guard: BTreeMap::new(),
                 },
             )]),
         };
         let plan = resolve_route(
             &graph,
             "read-article",
-            Some("home"),
+            Some("screen_home"),
             &GraphContext::default(),
         );
         assert_eq!(plan.status, "ok");

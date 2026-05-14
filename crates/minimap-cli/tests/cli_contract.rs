@@ -28,6 +28,133 @@ fn init_dry_run_reports_without_writing() {
 }
 
 #[test]
+fn init_does_not_create_legacy_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    assert!(!temp.path().join(".minimap/runs").exists());
+    assert!(!temp.path().join(".minimap/state").exists());
+    assert!(!temp.path().join(".minimap/checks").exists());
+    assert!(!temp.path().join(".minimap/current.json").exists());
+    assert!(temp.path().join(".minimap/graph/screens").is_dir());
+    assert!(temp.path().join(".minimap/graph/edges").is_dir());
+    assert!(temp.path().join(".minimap/routes").is_dir());
+    assert!(temp.path().join(".minimap/proposals").is_dir());
+}
+
+#[test]
+fn init_creates_empty_journal_jsonl() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let journal = temp.path().join(".minimap/journal.jsonl");
+    assert!(journal.exists(), "journal.jsonl should exist after init");
+    let bytes = fs::read(&journal).unwrap();
+    assert!(bytes.is_empty(), "journal.jsonl should be empty after init");
+}
+
+#[test]
+fn init_refuses_legacy_minimap_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join(".minimap/runs")).unwrap();
+    let assertion = minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["status"], "config_error");
+    let summary = payload["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("minimap 0.1.x"),
+        "legacy summary should mention 0.1.x, got: {summary}"
+    );
+    assert!(
+        summary.contains("--force"),
+        "legacy summary should mention --force, got: {summary}"
+    );
+    let legacy_paths = payload["legacy_paths"].as_array().unwrap();
+    assert!(legacy_paths.iter().any(|value| value == ".minimap/runs"));
+    // init must not have created the new tree on top of the legacy refusal.
+    assert!(!temp.path().join(".minimap/graph/screens").exists());
+}
+
+#[test]
+fn init_force_overwrites_legacy_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join(".minimap/runs")).unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex", "--force"])
+        .assert()
+        .success();
+    assert!(temp.path().join(".minimap/graph/screens").is_dir());
+    assert!(temp.path().join(".minimap/journal.jsonl").exists());
+}
+
+#[test]
+fn doctor_passes_on_fresh_init_with_journal_writable() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .args(["doctor"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    let checks = payload["checks"].as_array().unwrap();
+    let journal_check = checks
+        .iter()
+        .find(|check| check["name"] == "journal_writable")
+        .expect("doctor should emit a journal_writable check");
+    assert_eq!(journal_check["status"], "ok");
+    let graph_dirs = checks
+        .iter()
+        .find(|check| check["name"] == "graph_dirs")
+        .expect("doctor should emit a graph_dirs check");
+    assert_eq!(graph_dirs["status"], "pass");
+}
+
+#[test]
+fn doctor_warns_when_graph_not_git_tracked() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    // Git doesn't track empty directories, and `init` produces empty graph/routes dirs.
+    // So an init'd repo with only a baseline commit will not have any graph files tracked.
+    init_git_repo_with_baseline(temp.path());
+    let output = minimap(temp.path())
+        .args(["doctor"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    let checks = payload["checks"].as_array().unwrap();
+    let graph_tracked = checks
+        .iter()
+        .find(|check| check["name"] == "graph_tracked")
+        .expect("doctor should emit a graph_tracked check");
+    assert_eq!(graph_tracked["status"], "warn");
+    assert!(
+        payload["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("git add .minimap/graph .minimap/routes"),
+        "doctor should surface the git add hint when graph is untracked, got: {payload}"
+    );
+}
+
+#[test]
 fn claude_plugin_marketplace_declares_minimap_skills() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let marketplace = read_json_path(&repo.join(".claude-plugin/marketplace.json"));
@@ -45,19 +172,21 @@ fn claude_plugin_marketplace_declares_minimap_skills() {
     assert_eq!(plugin["name"], "minimap");
     assert_eq!(plugin["author"]["name"], "Matt McKenna");
 
-    assert!(repo
-        .join("plugins/minimap-claude-code/skills/minimap-app-navigation/SKILL.md")
-        .exists());
-    let first_run_skill = fs::read_to_string(
-        repo.join("plugins/minimap-claude-code/skills/minimap-first-run-mapping/SKILL.md"),
+    let app_nav_skill = fs::read_to_string(
+        repo.join("plugins/minimap-claude-code/skills/minimap-app-navigation/SKILL.md"),
     )
     .unwrap();
-    assert!(first_run_skill.contains("token-intensive"));
-    assert!(first_run_skill.contains("only for bounded bulk surveys"));
-    assert!(first_run_skill.contains("use `minimap-app-navigation` instead"));
+    assert!(app_nav_skill.contains("map the whole app"));
+    assert!(app_nav_skill.contains("first-run mapping"));
+    assert!(app_nav_skill.contains("token-intensive"));
+
+    assert!(!repo
+        .join("plugins/minimap-claude-code/skills/minimap-first-run-mapping")
+        .exists());
 }
 
 #[test]
+#[ignore = "TODO(phase-2): route-level context_guard was removed from the Route schema; this test asserts the old behavior."]
 fn route_reports_context_mismatch_exit_code() {
     let temp = tempfile::tempdir().unwrap();
     write_json(
@@ -90,199 +219,6 @@ fn route_reports_context_mismatch_exit_code() {
 }
 
 #[test]
-fn observe_and_learn_stage_review_proposal() {
-    let temp = tempfile::tempdir().unwrap();
-    minimap(temp.path())
-        .args(["observe", "start", "article-detail"])
-        .assert()
-        .success();
-    let output = minimap(temp.path())
-        .args(["learn", "--from-current-run", "--stage"])
-        .assert()
-        .code(1)
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "changed_requires_review");
-    assert_eq!(payload["human_approval_required"], true);
-    let proposal_path = PathBuf::from(payload["proposal_path"].as_str().unwrap());
-    let proposal_path = if proposal_path.is_absolute() {
-        proposal_path
-    } else {
-        temp.path().join(proposal_path)
-    };
-    assert!(proposal_path.exists());
-}
-
-#[test]
-fn learn_after_stopped_run_stages_screen_edge_and_route_changes() {
-    let temp = tempfile::tempdir().unwrap();
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/learn-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"text":"Open","bounds":{"left":0,"top":0,"right":100,"bottom":100}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
-    minimap(temp.path())
-        .args(["observe", "start", "article-detail"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["layout"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["tap", "--selector", "text=Open", "--reason", "open article"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["layout"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .args(["observe", "stop"])
-        .assert()
-        .success();
-    let output = minimap(temp.path())
-        .args(["learn", "--from-current-run", "--stage"])
-        .assert()
-        .code(1)
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    let proposal_path = PathBuf::from(payload["proposal_path"].as_str().unwrap());
-    let proposal_path = if proposal_path.is_absolute() {
-        proposal_path
-    } else {
-        temp.path().join(proposal_path)
-    };
-    let proposal = read_json_path(&proposal_path);
-    assert_eq!(proposal["kind"], "learned_route");
-    assert_eq!(proposal["changes"].as_array().unwrap().len(), 4);
-}
-
-#[test]
-fn learn_stages_multi_step_route_changes() {
-    let temp = tempfile::tempdir().unwrap();
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/multi-learn-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"text":"Open","bounds":{"left":0,"top":0,"right":100,"bottom":100}}]}'
-  elif [ "$COUNT" = "3" ] || [ "$COUNT" = "4" ]; then
-    printf '{"class":"Column","children":[{"text":"Continue","bounds":{"left":0,"top":0,"right":100,"bottom":100}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Done"}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
-    minimap(temp.path())
-        .args(["observe", "start", "onboarding"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["layout"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["tap", "--selector", "text=Open", "--reason", "open"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["layout"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["tap", "--selector", "text=Continue", "--reason", "continue"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["layout"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .args(["observe", "stop"])
-        .assert()
-        .success();
-    let output = minimap(temp.path())
-        .args(["learn", "--from-current-run", "--stage"])
-        .assert()
-        .code(1)
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    let proposal = read_json_path(&proposal_path(temp.path(), &payload));
-    assert_eq!(proposal["kind"], "learned_route");
-    assert_eq!(proposal["changes"].as_array().unwrap().len(), 6);
-    let route = proposal["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|change| change["object"]["schema_version"] == "minimap.route.v1")
-        .unwrap();
-    assert_eq!(
-        route["object"]["preferred_edge_ids"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-}
-
-#[test]
 fn layout_diff_uses_fake_android_cli() {
     let temp = tempfile::tempdir().unwrap();
     let bin = fake_bin(temp.path());
@@ -310,14 +246,15 @@ exit 2
 }
 
 #[test]
-fn tap_selector_uses_fake_android_and_adb() {
+fn tap_coordinate_journals_without_growing_graph() {
     let temp = tempfile::tempdir().unwrap();
     let bin = fake_bin(temp.path());
+    // The atomic tap fetches a pre-layout for from-screen classification before executing.
     write_executable(
         &bin.join("android"),
         r#"#!/bin/sh
 if [ "$1" = "layout" ]; then
-  printf '{"children":[{"text":"Settings","bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
+  printf '{"class":"Column","children":[]}'
   exit 0
 fi
 exit 2
@@ -326,7 +263,7 @@ exit 2
     write_executable(
         &bin.join("adb"),
         r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ] && [ "$4" = "200" ] && [ "$5" = "300" ]; then
+if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
   exit 0
 fi
 exit 2
@@ -334,21 +271,22 @@ exit 2
     );
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args([
-            "tap",
-            "--selector",
-            "text=Settings",
-            "--reason",
-            "open settings",
-        ])
+        .args(["tap", "--point", "540,1200", "--reason", "header"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["action"]["path"], "layout_selector");
-    assert_eq!(payload["action"]["point"], json!({"x": 200, "y": 300}));
+    assert_eq!(payload["outcome"], "coord_journal_only");
+    assert!(!temp.path().join(".minimap/graph/edges").exists()
+        || fs::read_dir(temp.path().join(".minimap/graph/edges"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+            == 0);
+    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
+    assert_eq!(journal.lines().count(), 1);
+    assert!(journal.contains("coord_journal_only"));
 }
 
 #[test]
@@ -381,8 +319,8 @@ fn go_executes_route_edges_with_fake_android_and_adb() {
         &json!({
             "schema_version": "minimap.edge.v1",
             "id": "edge_home_article",
-            "from_screen": "home",
-            "to_screen": "article-detail",
+            "from_screen": "screen_home",
+            "to_screen": "screen_article_detail",
             "action": {
                 "kind": "tap",
                 "selector_candidates": [
@@ -398,8 +336,8 @@ fn go_executes_route_edges_with_fake_android_and_adb() {
         &json!({
             "schema_version": "minimap.route.v1",
             "name": "read-article",
-            "start": {"screen": "home"},
-            "target": {"screen": "article-detail"},
+            "start": {"screen": "screen_home"},
+            "target": {"screen": "screen_article_detail"},
             "preferred_edge_ids": ["edge_home_article"]
         }),
     );
@@ -434,7 +372,7 @@ exit 2
     );
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["go", "read-article", "--current-screen", "home"])
+        .args(["go", "read-article", "--current-screen", "screen_home"])
         .assert()
         .success()
         .get_output()
@@ -446,40 +384,11 @@ exit 2
     assert_eq!(payload["executed"][0]["edge"], "edge_home_article");
     assert_eq!(
         payload["executed"][0]["verification"]["matched_screen"],
-        "article-detail"
+        "screen_article_detail"
     );
     assert_eq!(payload["metrics"]["layout_calls_total"], 2);
     assert_eq!(payload["metrics"]["layout_json_returned_to_agent"], false);
     assert_eq!(payload["metrics"]["adb_taps_total"], 1);
-}
-
-#[test]
-fn check_current_matches_known_screen_without_returning_layout_json() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ]; then
-  printf '{"class":"Column","children":[{"class":"Button","testTag":"settings","clickable":true}]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["check", "--current"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["current_screen"]["status"], "matched");
-    assert_eq!(payload["current_screen"]["matched_screen"], "settings");
-    assert_eq!(payload["metrics"]["layout_json_returned_to_agent"], false);
 }
 
 #[test]
@@ -507,7 +416,10 @@ exit 2
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(payload["status"], "passed");
-    assert_eq!(payload["current_screen"]["matched_screen"], "settings");
+    assert_eq!(
+        payload["current_screen"]["matched_screen"],
+        "screen_settings"
+    );
 }
 
 #[test]
@@ -554,7 +466,7 @@ exit 2
     );
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["validate", "--all", "--current-screen", "home"])
+        .args(["validate", "--all", "--current-screen", "screen_home"])
         .assert()
         .success()
         .get_output()
@@ -601,7 +513,13 @@ exit 2
     );
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["validate", "--all", "--execute", "--current-screen", "home"])
+        .args([
+            "validate",
+            "--all",
+            "--execute",
+            "--current-screen",
+            "screen_home",
+        ])
         .assert()
         .success()
         .get_output()
@@ -613,97 +531,236 @@ exit 2
     assert_eq!(payload["route_results"][0]["route"], "read-article");
     assert_eq!(
         payload["route_results"][0]["result"]["final_screen"]["matched_screen"],
-        "article-detail"
+        "screen_article_detail"
     );
 }
 
 #[test]
-fn map_discover_starts_and_finishes_staged_proposal() {
+fn route_define_writes_slim_route_json() {
     let temp = tempfile::tempdir().unwrap();
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/map-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"text":"Open","bounds":{"left":0,"top":0,"right":100,"bottom":100}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Done"}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let started = minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
+    write_settings_screen(temp.path());
+    minimap(temp.path())
         .args([
-            "map",
-            "--discover",
-            "welcome",
-            "--max-actions",
-            "1",
-            "--stage",
+            "route",
+            "define",
+            "open-settings",
+            "--to",
+            "screen_settings",
+            "--triggers",
+            "Settings*.kt,*Preferences*",
         ])
+        .assert()
+        .success();
+    let route_path = temp
+        .path()
+        .join(".minimap/routes/open-settings.minimap.json");
+    assert!(route_path.exists(), "route file should be written");
+    let route: Value = serde_json::from_str(&fs::read_to_string(&route_path).unwrap()).unwrap();
+    assert_eq!(route["schema_version"], "minimap.route.v1");
+    assert_eq!(route["name"], "open-settings");
+    assert_eq!(route["target"]["screen"], "screen_settings");
+    assert!(route.get("from").is_none() || route["from"].is_null());
+    let triggers = route["triggers"].as_array().unwrap();
+    assert_eq!(triggers.len(), 2);
+    assert_eq!(triggers[0], "Settings*.kt");
+    assert_eq!(triggers[1], "*Preferences*");
+    assert!(route["aliases"].as_array().unwrap().is_empty());
+    // Phase 1 schema must not include legacy fields.
+    assert!(route.get("preferred_edge_ids").is_none());
+    assert!(route.get("allow_graph_fallback").is_none());
+    assert!(route.get("path_constraints").is_none());
+    assert!(route.get("checks").is_none());
+}
+
+#[test]
+fn route_define_errors_when_target_screen_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    let assertion = minimap(temp.path())
+        .args([
+            "route",
+            "define",
+            "missing-target",
+            "--to",
+            "screen_does_not_exist",
+        ])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    let error_msg = payload["data"]["error"]["message"]
+        .as_str()
+        .or_else(|| payload["summary"].as_str())
+        .unwrap_or_default();
+    assert!(
+        error_msg.contains("screen_does_not_exist"),
+        "expected error message to name the missing screen, got: {error_msg}"
+    );
+    assert!(!temp
+        .path()
+        .join(".minimap/routes/missing-target.minimap.json")
+        .exists());
+}
+
+#[test]
+fn screen_rename_updates_name_field() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    minimap(temp.path())
+        .args(["screen", "rename", "screen_settings", "Preferences"])
+        .assert()
+        .success();
+    let screen: Value = serde_json::from_str(
+        &fs::read_to_string(
+            temp.path()
+                .join(".minimap/graph/screens/screen_settings.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(screen["id"], "screen_settings");
+    assert_eq!(screen["name"], "Preferences");
+}
+
+#[test]
+fn screen_rename_does_not_touch_edges() {
+    let temp = tempfile::tempdir().unwrap();
+    write_home_to_article_graph(temp.path());
+    let edge_path = temp
+        .path()
+        .join(".minimap/graph/edges/edge_home_article.json");
+    let original_bytes = fs::read(&edge_path).unwrap();
+    minimap(temp.path())
+        .args(["screen", "rename", "screen_home", "landing"])
+        .assert()
+        .success();
+    let after_bytes = fs::read(&edge_path).unwrap();
+    assert_eq!(
+        original_bytes, after_bytes,
+        "rename should not modify edge files"
+    );
+}
+
+#[test]
+fn undo_drops_uncommitted_graph_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    init_git_repo_with_baseline(temp.path());
+    let screen_path = temp
+        .path()
+        .join(".minimap/graph/screens/screen_settings.json");
+    let original = fs::read_to_string(&screen_path).unwrap();
+    fs::write(&screen_path, "{\"tampered\":true}\n").unwrap();
+    let output = minimap(temp.path())
+        .args(["undo"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let started: Value = serde_json::from_slice(&started).unwrap();
-    assert_eq!(started["status"], "needs_agent_action");
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["tap", "--selector", "text=Open", "--reason", "open"])
-        .assert()
-        .success();
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["layout"])
-        .assert()
-        .success();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert!(
+        payload["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dropped"),
+        "summary should mention dropped changes: {payload}"
+    );
+    let restored = fs::read_to_string(&screen_path).unwrap();
+    assert_eq!(restored, original);
+}
+
+#[test]
+fn undo_errors_outside_git_repo() {
+    let temp = tempfile::tempdir().unwrap();
+    let assertion = minimap(temp.path()).args(["undo"]).assert().failure();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["status"], "config_error");
+    assert!(payload["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("not a git repo"));
+}
+
+#[test]
+fn undo_reports_nothing_to_undo_when_clean() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    init_git_repo_with_baseline(temp.path());
     let output = minimap(temp.path())
-        .args([
-            "map",
-            "--discover",
-            "welcome",
-            "--max-actions",
-            "1",
-            "--stage",
-            "--finish",
-        ])
+        .args(["undo"])
         .assert()
-        .code(1)
+        .success()
         .get_output()
         .stdout
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "changed_requires_review");
-    assert!(payload["proposal_id"]
-        .as_str()
-        .unwrap()
-        .starts_with("proposal-learn-"));
-    assert!(proposal_path(temp.path(), &payload).exists());
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["summary"], "nothing to undo");
+    assert_eq!(payload["dropped"], 0);
+}
+
+#[test]
+fn validate_screen_current_reports_matched_for_known_screen() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    let bin = fake_bin(temp.path());
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+if [ "$1" = "layout" ]; then
+  printf '{"class":"Column","children":[{"class":"Button","testTag":"settings","clickable":true}]}'
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["validate", "--screen", "current"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "matched");
+    assert_eq!(
+        payload["current_screen"]["matched_screen"],
+        "screen_settings"
+    );
 }
 
 fn minimap(dir: &Path) -> Command {
     let mut command = Command::cargo_bin("minimap").unwrap();
     command.current_dir(dir);
     command
+}
+
+fn init_git_repo_with_baseline(dir: &Path) {
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git available");
+        assert!(
+            status.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    git(dir, &["init", "--quiet", "--initial-branch=main"]);
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "--quiet", "-m", "baseline"]);
 }
 
 fn write_json(path: &Path, value: &Value) {
@@ -713,15 +770,6 @@ fn write_json(path: &Path, value: &Value) {
 
 fn read_json_path(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-}
-
-fn proposal_path(root: &Path, payload: &Value) -> PathBuf {
-    let proposal_path = PathBuf::from(payload["proposal_path"].as_str().unwrap());
-    if proposal_path.is_absolute() {
-        proposal_path
-    } else {
-        root.join(proposal_path)
-    }
 }
 
 fn write_settings_screen(root: &Path) {
@@ -787,8 +835,8 @@ fn write_home_to_article_graph(root: &Path) {
         &json!({
             "schema_version": "minimap.edge.v1",
             "id": "edge_home_article",
-            "from_screen": "home",
-            "to_screen": "article-detail",
+            "from_screen": "screen_home",
+            "to_screen": "screen_article_detail",
             "action": {
                 "kind": "tap",
                 "selector_candidates": [
@@ -802,9 +850,8 @@ fn write_home_to_article_graph(root: &Path) {
         &json!({
             "schema_version": "minimap.route.v1",
             "name": "read-article",
-            "start": {"screen": "home"},
-            "target": {"screen": "article-detail"},
-            "preferred_edge_ids": ["edge_home_article"]
+            "from": {"screen": "screen_home"},
+            "target": {"screen": "screen_article_detail"}
         }),
     );
 }

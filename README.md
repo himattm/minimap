@@ -52,81 +52,54 @@ naturally use the app. There is no required baseline survey.
 
 ### Grow the graph one screen at a time
 
-While you are using the app, record the route you just took:
+While you are using the app, just tap. The graph commits inline:
 
 ```bash
-minimap observe start article-detail
 minimap layout
 minimap tap --selector "text=Open" --reason "open article detail"
-minimap layout
-minimap observe stop
-minimap learn --from-current-run --stage
 ```
 
-Review the staged proposal, then explicitly accept it:
+Each `tap` either matches an existing screen and commits an edge, creates a new
+screen and commits an edge, or stages a drift proposal for ambiguous cases. The
+ambiguous case is rare — only then is `minimap accept <proposal-id>` involved.
+
+Name a route after walking it:
 
 ```bash
-minimap accept <proposal-id>
+minimap route define article-detail --to screen_article_detail --from screen_home
 ```
-
-Repeat for the next screen the next time you (or an agent) navigate somewhere
-worth remembering. The graph grows over time without a separate setup phase.
 
 ### Reuse and validate
 
 Once a route is in the graph, reuse and validate it:
 
 ```bash
-minimap route article-detail --current-screen home
-minimap go article-detail --current-screen home
-minimap check --current
+minimap route resolve article-detail
+minimap go article-detail
+minimap validate --screen current
 minimap drift
-minimap validate --all
-minimap validate --all --execute --current-screen home
 ```
 
-## First-Run Agent Mapping (optional)
+## Bulk Mapping (optional)
 
-`minimap init --agents all` installs two repo-local skills for supported agents:
-`minimap-app-navigation` for everyday navigation and incremental graph growth, and
-`minimap-first-run-mapping` for optional bulk surveys.
+`minimap init --agents all` installs the `minimap-app-navigation` skill, which
+covers both everyday navigation and bulk mapping.
 
-Most users will not need first-run mapping. The incremental flow above grows the
-graph naturally over time, one screen per session, as the app is actually used.
+Most users will not need a bulk pass. The incremental flow above grows the
+graph naturally over time as the app is used.
 
-If you want a quick bulk pass over many flows at once — for example, seeding a
+If you want a bulk pass over many flows at once — for example, seeding a
 brand-new repo with coverage of the settings, profile, and article-detail flows
-in a single sustained run — the `minimap-first-run-mapping` skill exists. It is
-token-intensive: the agent has to inspect Android layout JSON, decide what to
-tap, navigate the launched app, and record many routes in one sitting. Invoke it
-only when you explicitly want that bulk pass, or for a bounded reason such as a
-major UI redesign, a new auth/onboarding context, or explicit additional route
-coverage across multiple flows.
+in one sitting — ask the skill explicitly. It is token-intensive: the agent has
+to inspect Android layout JSON, decide what to tap, and walk many routes in a
+single session. The skill will warn you and propose a scoped list of named
+flows before starting.
 
 Example prompt:
 
 ```text
-Use the minimap-first-run-mapping skill to perform first-run mapping for this
-launched Android app. Start with the settings, profile, and article detail flows.
-Warn me before any especially broad exploration. Stage learned Minimap proposals,
-but do not accept or commit them until I approve.
-```
-
-The agent should use this loop for each route:
-
-```bash
-minimap map --discover <route-name> --max-actions 5 --stage
-minimap layout
-minimap tap --selector "<kind>=<value>" --reason "<navigation reason>"
-minimap layout
-minimap map --discover <route-name> --max-actions 5 --stage --finish
-```
-
-Review staged proposals before accepting:
-
-```bash
-minimap accept <proposal-id>
-minimap validate --all
+Bulk-map this Android app. Start with the settings, profile, and article-detail
+flows. Warn me before exploring outside that list.
 ```
 
 ## Claude Code Plugin
@@ -156,18 +129,16 @@ For local development from a checkout:
 The plugin includes:
 
 - `minimap-app-navigation` for everyday Minimap navigation, incremental graph
-  growth one screen at a time, route reuse, and validation.
-- `minimap-first-run-mapping` for optional bounded bulk surveys when the user
-  explicitly asks to map many flows at once.
+  growth one screen at a time, route reuse, validation, and bulk mapping when
+  the user explicitly asks to map many flows at once.
 
 ## Product Rules
 
 - Raw Android layout JSON is not committed by default.
 - Redaction runs before hashing, normalization, or graph proposal generation.
-- Runtime data stays under `.minimap/runs/` and `.minimap/state/`, which are
-  gitignored by `minimap init`.
-- Minimap may stage graph updates automatically, but committed graph changes only
-  happen after `minimap accept`.
+- Append-only `.minimap/journal.jsonl` is gitignored by `minimap init`.
+- `minimap tap` auto-commits Screen and NavigationEdge JSON inline. Only
+  ambiguous drift lands in `.minimap/proposals/` and requires `minimap accept`.
 - `android layout --diff` remains an Android in-session diff. Minimap graph drift
   is reported by `minimap drift` and `minimap validate`.
 
@@ -179,14 +150,14 @@ With a built and launched Android app plus `android` and `adb` on `PATH`:
 minimap doctor
 minimap layout
 minimap tap --selector "text=Settings" --reason "open settings"
-minimap check --current
+minimap validate --screen current
 ```
 
 For a known route already committed under `.minimap/`:
 
 ```bash
-minimap go <route-or-screen> --current-screen <screen-name>
-minimap validate --all
+minimap go <route-or-screen>
+minimap drift
 ```
 
 Live device tests are intentionally separate from CI. CI uses fake `android` and

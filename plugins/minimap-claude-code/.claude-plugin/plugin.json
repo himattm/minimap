@@ -1,6 +1,6 @@
 {
   "name": "minimap",
-  "description": "Minimap skills for Claude Code: route reuse and first-run mapping for Android app navigation memory.",
+  "description": "Minimap skill for Claude Code: incremental navigation memory for Android apps. The graph grows one tap at a time.",
   "version": "0.1.3",
   "author": {
     "name": "Matt McKenna"

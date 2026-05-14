@@ -242,7 +242,7 @@ pub fn match_screen(normalized: &Value, screens: impl Iterator<Item = ScreenNode
         if screen.identity_hash == current_hash {
             return MatchResult {
                 status: "matched".to_string(),
-                matched_screen: Some(screen.name),
+                matched_screen: Some(screen.id),
                 match_confidence: 1.0,
                 hash_matched: true,
             };
@@ -254,7 +254,7 @@ pub fn match_screen(normalized: &Value, screens: impl Iterator<Item = ScreenNode
                 .map(|(_, best_score)| score > *best_score)
                 .unwrap_or(true)
             {
-                best = Some((screen.name, score));
+                best = Some((screen.id, score));
             }
         }
     }
@@ -386,6 +386,6 @@ mod tests {
         };
         let result = match_screen(&normalized, vec![screen].into_iter());
         assert_eq!(result.status, "matched");
-        assert_eq!(result.matched_screen.as_deref(), Some("settings"));
+        assert_eq!(result.matched_screen.as_deref(), Some("screen_settings"));
     }
 }
