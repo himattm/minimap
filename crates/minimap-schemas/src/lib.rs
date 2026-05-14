@@ -154,6 +154,11 @@ pub struct JournalEntry {
     pub to_screen_id: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// One of the documented outcome strings emitted by atomic tap:
+    /// `matched` | `new_screen` | `drift_staged` | `coord_journal_only` | `tap_failed`
+    /// | `from_screen_unknown`. `from_screen_unknown` means the pre-tap layout did
+    /// not match any committed screen, so the tap was executed but no edge was
+    /// grown — re-run `minimap layout` (or commit the current screen) to get oriented.
     pub outcome: String,
 }
 

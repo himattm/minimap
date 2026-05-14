@@ -14,6 +14,8 @@ Minimap is this repo's shared navigation memory for AI agents working in this An
 
 Minimap maintains a graph of the app under `.minimap/graph/`. Every `minimap tap --selector ...` you make grows the graph automatically — the matched-or-new-screen and the edge are committed inline. There is no separate "learn" or "promote" step. The only thing that ever lands in `.minimap/proposals/` is an ambiguous drift band, which is rare.
 
+If `tap` is invoked from a screen the graph doesn't yet know, the tap still executes and is journalled, but no edge is grown (the journal entry shows `outcome: from_screen_unknown`). Run `minimap layout` first to get oriented before tapping again.
+
 ## Core loop
 
 One atomic primitive. Repeat until the user's stated goal is reached.

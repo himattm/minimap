@@ -8,8 +8,9 @@ use minimap_core::{identity_hash, match_screen, normalize_layout};
 use minimap_graph::{exit_code_for_status, resolve_route};
 use minimap_repo::{
     accept_proposal, append_journal_entry, commit_edge, commit_route, commit_screen,
-    detect_legacy_minimap, load_context, load_graph, rename_screen, run_init, screen_path,
-    stage_proposal_value, LEGACY_MINIMAP_MESSAGE,
+    derive_screen_name, detect_legacy_minimap, edge_id_for, load_context, load_graph,
+    new_screen_id, post_tap_settle_ms, rename_screen, run_init, screen_path,
+    stage_proposal_value, AcceptResolution, LEGACY_MINIMAP_MESSAGE,
 };
 use minimap_schemas::{
     canonical_json, JournalEntry, MinimapResult, NavigationEdge, JOURNAL_ENTRY_SCHEMA_VERSION,
@@ -20,9 +21,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-// Post-tap settle: give the device a moment to render the new layout before re-querying it.
-const POST_TAP_SETTLE_MS: u64 = 500;
 
 #[derive(Debug, Parser)]
 #[command(name = "minimap")]
@@ -108,7 +106,13 @@ enum Commands {
         screen: Option<String>,
     },
     /// Accept a staged proposal by id; the only command that mutates the committed graph through the review path.
-    Accept { proposal_id: String },
+    Accept {
+        proposal_id: String,
+        /// For `selector_drift` proposals only: materialize the observed layout as a new
+        /// screen and grow an edge from the source, instead of merging with the candidate.
+        #[arg(long = "as-new")]
+        as_new: bool,
+    },
     /// Discard uncommitted changes to .minimap/graph and .minimap/routes via git checkout.
     Undo,
 }
@@ -121,7 +125,9 @@ enum RouteCommand {
         #[arg(long)]
         current_screen: Option<String>,
     },
-    /// Define a new route from --from screen to --to screen with optional triggers.
+    /// Define a new route from --from screen to --to screen. Pass `--triggers <glob>`
+    /// multiple times for multiple glob patterns; each occurrence is one trigger entry
+    /// (commas inside a glob like `{login,signup}/**` are preserved verbatim).
     Define {
         name: String,
         #[arg(long)]
@@ -282,8 +288,16 @@ fn run(cli: Cli) -> Result<i32> {
             print_json(&result);
             Ok(code)
         }
-        Commands::Accept { proposal_id } => {
-            let written = accept_proposal(&root, &proposal_id)?;
+        Commands::Accept {
+            proposal_id,
+            as_new,
+        } => {
+            let resolution = if as_new {
+                AcceptResolution::AsNew
+            } else {
+                AcceptResolution::Default
+            };
+            let written = accept_proposal(&root, &proposal_id, resolution)?;
             print_json(&json!({
                 "schema_version": RESULT_SCHEMA_VERSION,
                 "status": "ok",
@@ -415,8 +429,9 @@ fn tap_atomic(
         return Ok(0);
     }
 
-    // Post-tap settle + re-query layout.
-    thread::sleep(Duration::from_millis(POST_TAP_SETTLE_MS));
+    // Post-tap settle + re-query layout. Settle window comes from
+    // `navigation.post_tap_settle_ms` in `.minimap/config.json`, defaulting to 500.
+    thread::sleep(Duration::from_millis(post_tap_settle_ms(root)));
     let post = layout_result(&mut android, false)?;
     let post_layout = post["layout"].clone();
 
@@ -578,6 +593,25 @@ fn commit_step(
         "repair_candidate" => {
             let candidate = match_result.matched_screen.clone();
             let proposal_id = format!("proposal-drift-{}", &hash[7..15.min(hash.len())]);
+            // Default resolution: grow an edge from `from_screen_id` to the existing candidate.
+            // `accept_proposal` (Default) iterates this `changes` array; `--as-new` ignores it
+            // and synthesizes a fresh screen + edge from the diagnostic fields below.
+            let default_changes = if let Some(candidate_id) = candidate.clone() {
+                // Mix the proposal id into the hash material so the edge id is stable per
+                // proposal — re-accepting the same proposal overwrites the same edge file.
+                let edge_hash = format!("{hash}:{proposal_id}");
+                let edge_id = edge_id_for(from_screen_id, &candidate_id, &edge_hash);
+                let edge = build_edge_value(
+                    &edge_id,
+                    from_screen_id,
+                    &candidate_id,
+                    &selector_candidates,
+                    reason,
+                );
+                vec![json!({ "op": "add", "object": edge })]
+            } else {
+                Vec::new()
+            };
             let proposal = json!({
                 "schema_version": "minimap.proposal.v1",
                 "id": proposal_id.clone(),
@@ -591,7 +625,7 @@ fn commit_step(
                 "observed_normalized": normalized,
                 "selector_candidates": selector_candidates,
                 "tap_reason": reason,
-                "changes": []
+                "changes": default_changes
             });
             stage_proposal_value(root, &proposal)?;
             Ok(StepOutcome::DriftStaged {
@@ -672,79 +706,6 @@ fn build_edge_value(
         "expectations": [{"kind": "screen_reached", "screen": to_screen_id}],
         "learned_from": {"source": "atomic_tap"}
     })
-}
-
-fn new_screen_id(identity_hash: &str) -> String {
-    // identity_hash format: "sha256:<hex>". Take first 8 hex chars after the prefix.
-    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
-    let suffix: String = hex.chars().take(8).collect();
-    format!("screen_{suffix}")
-}
-
-fn edge_id_for(from_screen_id: &str, to_screen_id: &str, identity_hash: &str) -> String {
-    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
-    let suffix: String = hex.chars().take(8).collect();
-    format!("edge_{from_screen_id}__{to_screen_id}__{suffix}")
-}
-
-fn derive_screen_name(layout: &Value, fallback_id: &str) -> String {
-    if let Some(name) = walk_first_string(layout, &["contentDescription", "content_description"]) {
-        return name;
-    }
-    if let Some(text) = walk_first_text(layout) {
-        return text;
-    }
-    fallback_id.to_string()
-}
-
-fn walk_first_string(value: &Value, keys: &[&str]) -> Option<String> {
-    if let Value::Object(map) = value {
-        for key in keys {
-            if let Some(Value::String(text)) = map.get(*key) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        for (_, child) in map {
-            if let Some(found) = walk_first_string(child, keys) {
-                return Some(found);
-            }
-        }
-    } else if let Value::Array(values) = value {
-        for child in values {
-            if let Some(found) = walk_first_string(child, keys) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn walk_first_text(value: &Value) -> Option<String> {
-    if let Value::Object(map) = value {
-        for key in ["text", "label", "title"] {
-            if let Some(Value::String(text)) = map.get(key) {
-                let trimmed = text.trim();
-                if trimmed.len() >= 2 && !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        for (_, child) in map {
-            if let Some(found) = walk_first_text(child) {
-                return Some(found);
-            }
-        }
-    } else if let Value::Array(values) = value {
-        for child in values {
-            if let Some(found) = walk_first_text(child) {
-                return Some(found);
-            }
-        }
-    }
-    None
 }
 
 fn journal_entry(
@@ -1263,16 +1224,13 @@ fn route_define(
 }
 
 fn expand_triggers(triggers: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for value in triggers {
-        for part in value.split(',') {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                out.push(trimmed.to_string());
-            }
-        }
-    }
-    out
+    // Each `--triggers` arg is one entry verbatim — commas are part of glob syntax
+    // (e.g. `{login,signup}/**`) and must not be split.
+    triggers
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn screen_rename(root: &Path, id: &str, new_name: &str) -> Result<i32> {

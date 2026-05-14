@@ -197,7 +197,8 @@ pub fn default_config() -> Value {
             "safe_mode_fallback": true,
             "screen_match_confidence_min": 0.78,
             "repair_candidate_confidence_min": 0.65,
-            "transition_timeout_ms": 3000
+            "transition_timeout_ms": 3000,
+            "post_tap_settle_ms": 500
         },
         "normalization": {
             "store_normalized_bounds": true,
@@ -538,8 +539,24 @@ pub fn stage_proposal_value(root: &Path, proposal: &Value) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn accept_proposal(root: &Path, id: &str) -> Result<Vec<PathBuf>> {
+/// How `accept_proposal` should resolve a staged proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptResolution {
+    /// Apply the proposal's `changes` array as-is. The default for every proposal kind.
+    Default,
+    /// For `selector_drift` proposals only: materialize the observed layout as a
+    /// brand-new screen and grow an edge from the source, instead of merging with
+    /// the candidate. Errors for any other proposal kind.
+    AsNew,
+}
+
+pub fn accept_proposal(
+    root: &Path,
+    id: &str,
+    resolution: AcceptResolution,
+) -> Result<Vec<PathBuf>> {
     let value = read_json(&proposal_path(root, id))?;
+    let proposal_value = value.clone();
     let proposal: Proposal = serde_json::from_value(value)?;
     if proposal.schema_version != PROPOSAL_SCHEMA_VERSION {
         anyhow::bail!(
@@ -547,21 +564,182 @@ pub fn accept_proposal(root: &Path, id: &str) -> Result<Vec<PathBuf>> {
             proposal.schema_version
         );
     }
-    let mut written = Vec::new();
-    for change in proposal.changes {
-        let object = change
-            .get("object")
-            .context("proposal change must include object")?;
-        let schema = object.get("schema_version").and_then(Value::as_str);
-        let path = match schema {
-            Some(SCREEN_SCHEMA_VERSION) => commit_screen(root, object)?,
-            Some(EDGE_SCHEMA_VERSION) => commit_edge(root, object)?,
-            Some(ROUTE_SCHEMA_VERSION) => commit_route(root, object)?,
-            other => anyhow::bail!("unsupported proposal object schema_version {other:?}"),
-        };
-        written.push(path);
+    match resolution {
+        AcceptResolution::Default => {
+            let mut written = Vec::new();
+            for change in proposal.changes {
+                let object = change
+                    .get("object")
+                    .context("proposal change must include object")?;
+                let schema = object.get("schema_version").and_then(Value::as_str);
+                let path = match schema {
+                    Some(SCREEN_SCHEMA_VERSION) => commit_screen(root, object)?,
+                    Some(EDGE_SCHEMA_VERSION) => commit_edge(root, object)?,
+                    Some(ROUTE_SCHEMA_VERSION) => commit_route(root, object)?,
+                    other => anyhow::bail!("unsupported proposal object schema_version {other:?}"),
+                };
+                written.push(path);
+            }
+            Ok(written)
+        }
+        AcceptResolution::AsNew => accept_as_new(root, &proposal_value, &proposal),
     }
-    Ok(written)
+}
+
+fn accept_as_new(root: &Path, proposal_value: &Value, proposal: &Proposal) -> Result<Vec<PathBuf>> {
+    if proposal.kind != "selector_drift" {
+        anyhow::bail!(
+            "accept --as-new is only valid for selector_drift proposals (this is kind '{}')",
+            proposal.kind
+        );
+    }
+    let identity_hash = proposal_value
+        .get("identity_hash")
+        .and_then(Value::as_str)
+        .context("selector_drift proposal missing identity_hash")?;
+    let from_screen_id = proposal_value
+        .get("from_screen_id")
+        .and_then(Value::as_str)
+        .context("selector_drift proposal missing from_screen_id")?;
+    let observed_normalized = proposal_value
+        .get("observed_normalized")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let observed_layout = proposal_value
+        .get("observed_layout")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let selector_candidates = proposal_value
+        .get("selector_candidates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tap_reason = proposal_value
+        .get("tap_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("learned tap");
+
+    let to_screen_id = new_screen_id(identity_hash);
+    let name = derive_screen_name(&observed_layout, &to_screen_id);
+    let screen = json!({
+        "schema_version": SCREEN_SCHEMA_VERSION,
+        "id": to_screen_id.clone(),
+        "name": name,
+        "identity_hash": identity_hash,
+        "normalized": observed_normalized,
+        "aliases": []
+    });
+    let screen_path = commit_screen(root, &screen)?;
+
+    let edge_id = edge_id_for(from_screen_id, &to_screen_id, identity_hash);
+    let edge = json!({
+        "schema_version": EDGE_SCHEMA_VERSION,
+        "id": edge_id,
+        "from_screen": from_screen_id,
+        "to_screen": to_screen_id,
+        "intent": tap_reason,
+        "action": {
+            "kind": "tap",
+            "description": tap_reason,
+            "selector_candidates": selector_candidates
+        },
+        "expectations": [{"kind": "screen_reached", "screen": to_screen_id}],
+        "learned_from": {"source": "accept_as_new"}
+    });
+    let edge_path = commit_edge(root, &edge)?;
+
+    Ok(vec![screen_path, edge_path])
+}
+
+/// Compute a stable screen handle from a SHA-256 identity hash.
+///
+/// `identity_hash` is expected in `sha256:<hex>` form; the result is `screen_<first 8 hex chars>`.
+pub fn new_screen_id(identity_hash: &str) -> String {
+    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
+    let suffix: String = hex.chars().take(8).collect();
+    format!("screen_{suffix}")
+}
+
+/// Deterministic edge handle from (from_screen, to_screen, identity_hash).
+pub fn edge_id_for(from_screen_id: &str, to_screen_id: &str, identity_hash: &str) -> String {
+    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
+    let suffix: String = hex.chars().take(8).collect();
+    format!("edge_{from_screen_id}__{to_screen_id}__{suffix}")
+}
+
+/// Best-effort display name derived from a raw layout JSON. Falls back to `fallback_id`.
+pub fn derive_screen_name(layout: &Value, fallback_id: &str) -> String {
+    if let Some(name) = walk_first_string(layout, &["contentDescription", "content_description"]) {
+        return name;
+    }
+    if let Some(text) = walk_first_text(layout) {
+        return text;
+    }
+    fallback_id.to_string()
+}
+
+fn walk_first_string(value: &Value, keys: &[&str]) -> Option<String> {
+    if let Value::Object(map) = value {
+        for key in keys {
+            if let Some(Value::String(text)) = map.get(*key) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        for (_, child) in map {
+            if let Some(found) = walk_first_string(child, keys) {
+                return Some(found);
+            }
+        }
+    } else if let Value::Array(values) = value {
+        for child in values {
+            if let Some(found) = walk_first_string(child, keys) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn walk_first_text(value: &Value) -> Option<String> {
+    if let Value::Object(map) = value {
+        for key in ["text", "label", "title"] {
+            if let Some(Value::String(text)) = map.get(key) {
+                let trimmed = text.trim();
+                if trimmed.len() >= 2 && !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        for (_, child) in map {
+            if let Some(found) = walk_first_text(child) {
+                return Some(found);
+            }
+        }
+    } else if let Value::Array(values) = value {
+        for child in values {
+            if let Some(found) = walk_first_text(child) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Read `navigation.post_tap_settle_ms` from `.minimap/config.json`. Defaults to 500
+/// when the file or the field is missing.
+pub fn post_tap_settle_ms(root: &Path) -> u64 {
+    let value = match read_json(&root.join(".minimap/config.json")) {
+        Ok(value) => value,
+        Err(_) => return 500,
+    };
+    value
+        .get("navigation")
+        .and_then(|nav| nav.get("post_tap_settle_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(500)
 }
 
 pub fn commit_screen(root: &Path, screen: &Value) -> Result<PathBuf> {
@@ -699,6 +877,27 @@ mod tests {
         assert_eq!(gitignore.matches(".minimap/journal.jsonl").count(), 1);
         assert!(!gitignore.contains(".minimap/runs/"));
         assert!(!gitignore.contains(".minimap/state/"));
+    }
+
+    #[test]
+    fn post_tap_settle_ms_reads_navigation_field() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(".minimap")).unwrap();
+        write_json(
+            &temp.path().join(".minimap/config.json"),
+            &json!({
+                "schema_version": "minimap.config.v1",
+                "navigation": { "post_tap_settle_ms": 999 }
+            }),
+        )
+        .unwrap();
+        assert_eq!(post_tap_settle_ms(temp.path()), 999);
+    }
+
+    #[test]
+    fn post_tap_settle_ms_defaults_to_500_when_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(post_tap_settle_ms(temp.path()), 500);
     }
 
     #[test]

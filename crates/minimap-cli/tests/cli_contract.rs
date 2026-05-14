@@ -547,7 +547,9 @@ fn route_define_writes_slim_route_json() {
             "--to",
             "screen_settings",
             "--triggers",
-            "Settings*.kt,*Preferences*",
+            "Settings*.kt",
+            "--triggers",
+            "*Preferences*",
         ])
         .assert()
         .success();
@@ -730,6 +732,518 @@ exit 2
     assert_eq!(
         payload["current_screen"]["matched_screen"],
         "screen_settings"
+    );
+}
+
+#[test]
+fn route_define_preserves_commas_in_glob_pattern() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    minimap(temp.path())
+        .args([
+            "route",
+            "define",
+            "auth-routes",
+            "--to",
+            "screen_settings",
+            "--triggers",
+            "{login,signup}/**",
+        ])
+        .assert()
+        .success();
+    let route_path = temp.path().join(".minimap/routes/auth-routes.minimap.json");
+    let route: Value = serde_json::from_str(&fs::read_to_string(&route_path).unwrap()).unwrap();
+    let triggers = route["triggers"].as_array().unwrap();
+    assert_eq!(triggers.len(), 1, "comma inside glob must not split");
+    assert_eq!(triggers[0], "{login,signup}/**");
+}
+
+#[test]
+fn tap_atomic_match_writes_edge_to_existing_screen() {
+    let temp = tempfile::tempdir().unwrap();
+    write_home_to_article_graph(temp.path());
+    let bin = fake_bin(temp.path());
+    // android layout is called three times during atomic tap:
+    //   1) pre-tap classification (tap_atomic)
+    //   2) inside tap_selector_result to resolve the selector to bounds
+    //   3) post-tap classification (tap_atomic)
+    // Returns home layout for the first two calls and article-detail for the third.
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+COUNT_FILE="$(dirname "$0")/android-count"
+COUNT=0
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
+COUNT=$((COUNT + 1))
+printf "%s" "$COUNT" > "$COUNT_FILE"
+if [ "$1" = "layout" ]; then
+  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
+    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
+  else
+    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
+  fi
+  exit 0
+fi
+exit 2
+"#,
+    );
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "test_tag=read_article",
+            "--reason",
+            "go to article",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["outcome"], "matched");
+    assert_eq!(payload["from_screen_id"], "screen_home");
+    assert_eq!(payload["to_screen_id"], "screen_article_detail");
+
+    // Screen count is unchanged (2 baseline screens, no new screen).
+    let screen_count = fs::read_dir(temp.path().join(".minimap/graph/screens"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+    assert_eq!(screen_count, 2);
+
+    // Exactly one new edge file from screen_home → screen_article_detail.
+    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    let new_edges: Vec<&Value> = edges
+        .iter()
+        .filter(|edge| edge["id"] != "edge_home_article")
+        .collect();
+    assert_eq!(new_edges.len(), 1, "atomic tap should write exactly one new edge");
+    assert_eq!(new_edges[0]["from_screen"], "screen_home");
+    assert_eq!(new_edges[0]["to_screen"], "screen_article_detail");
+
+    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
+    assert_eq!(journal.lines().count(), 1);
+    assert!(journal.contains("\"outcome\":\"matched\""));
+}
+
+#[test]
+fn tap_atomic_new_screen_writes_screen_and_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    // Single-screen fixture: screen_home only.
+    write_json(
+        &temp.path().join(".minimap/graph/screens/screen_home.json"),
+        &json!({
+            "schema_version": "minimap.screen.v1",
+            "id": "screen_home",
+            "name": "home",
+            "identity_hash": "sha256:not-fast-path",
+            "normalized": {
+                "schema_version": "minimap.normalized_layout.v1",
+                "elements": [
+                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
+                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/0", "sibling_bucket": 0, "resource_id": "read_article"}
+                ],
+                "role_distribution": {"Button": 1, "Column": 1},
+                "element_count": 2
+            }
+        }),
+    );
+    let bin = fake_bin(temp.path());
+    // First two layout calls (pre-tap + selector resolve) return home;
+    // third call (post-tap) returns a brand-new layout with no overlap.
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+COUNT_FILE="$(dirname "$0")/android-count"
+COUNT=0
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
+COUNT=$((COUNT + 1))
+printf "%s" "$COUNT" > "$COUNT_FILE"
+if [ "$1" = "layout" ]; then
+  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
+    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
+  else
+    printf '{"class":"Dialog","children":[{"class":"Text","text":"Permission denied"},{"class":"Text","text":"Please log in to continue"},{"class":"Button","testTag":"login_button","clickable":true},{"class":"Button","testTag":"cancel_button","clickable":true}]}'
+  fi
+  exit 0
+fi
+exit 2
+"#,
+    );
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "test_tag=read_article",
+            "--reason",
+            "discover next screen",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["outcome"], "new_screen");
+    assert_eq!(payload["from_screen_id"], "screen_home");
+    let to_screen_id = payload["to_screen_id"].as_str().unwrap();
+    assert!(to_screen_id.starts_with("screen_"));
+
+    // New screen file appeared.
+    let screens_dir = temp.path().join(".minimap/graph/screens");
+    let screen_count = fs::read_dir(&screens_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+    assert_eq!(screen_count, 2, "should have original home + new screen");
+    let new_screen_path = screens_dir.join(format!("{to_screen_id}.json"));
+    assert!(new_screen_path.exists(), "new screen JSON should exist");
+
+    // New edge from screen_home to new screen.
+    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["from_screen"], "screen_home");
+    assert_eq!(edges[0]["to_screen"], to_screen_id);
+
+    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
+    assert_eq!(journal.lines().count(), 1);
+    assert!(journal.contains("\"outcome\":\"new_screen\""));
+}
+
+#[test]
+fn tap_atomic_drift_stages_proposal_in_repair_band() {
+    let temp = tempfile::tempdir().unwrap();
+    // Screen A: a "hub" with 4 buttons + Column. Designed so a post-tap layout
+    // with 3 of those 4 buttons + 1 different button lands at jaccard ~0.667 on
+    // element keys and 1.0 on role distribution: similarity = 0.75 (drift band).
+    write_json(
+        &temp.path().join(".minimap/graph/screens/screen_hub.json"),
+        &json!({
+            "schema_version": "minimap.screen.v1",
+            "id": "screen_hub",
+            "name": "hub",
+            "identity_hash": "sha256:not-fast-path",
+            "normalized": {
+                "schema_version": "minimap.normalized_layout.v1",
+                "elements": [
+                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
+                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/0", "sibling_bucket": 0, "resource_id": "tile_a"},
+                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/1", "sibling_bucket": 1, "resource_id": "tile_b"},
+                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/2", "sibling_bucket": 2, "resource_id": "tile_c"},
+                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/3", "sibling_bucket": 3, "resource_id": "tile_d"}
+                ],
+                "role_distribution": {"Button": 4, "Column": 1},
+                "element_count": 5
+            }
+        }),
+    );
+    let bin = fake_bin(temp.path());
+    // Pre-tap (calls 1 & 2): hub with 4 tiles (exact match to screen_hub).
+    // Post-tap (call 3): hub-like with 3 of the 4 tiles + 1 different tile, same role distribution.
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+COUNT_FILE="$(dirname "$0")/android-count"
+COUNT=0
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
+COUNT=$((COUNT + 1))
+printf "%s" "$COUNT" > "$COUNT_FILE"
+if [ "$1" = "layout" ]; then
+  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
+    printf '{"class":"Column","children":[{"class":"Button","testTag":"tile_a","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}},{"class":"Button","testTag":"tile_b","clickable":true},{"class":"Button","testTag":"tile_c","clickable":true},{"class":"Button","testTag":"tile_d","clickable":true}]}'
+  else
+    printf '{"class":"Column","children":[{"class":"Button","testTag":"tile_a","clickable":true},{"class":"Button","testTag":"tile_b","clickable":true},{"class":"Button","testTag":"tile_c","clickable":true},{"class":"Button","testTag":"tile_new","clickable":true}]}'
+  fi
+  exit 0
+fi
+exit 2
+"#,
+    );
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+  exit 0
+fi
+exit 2
+"#,
+    );
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "test_tag=tile_a",
+            "--reason",
+            "open tile",
+        ])
+        .assert()
+        .code(1);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["outcome"], "drift_staged");
+    assert_eq!(payload["status"], "changed_requires_review");
+    assert_eq!(payload["from_screen_id"], "screen_hub");
+
+    // No new screen, no new edge.
+    let screen_count = fs::read_dir(temp.path().join(".minimap/graph/screens"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+    assert_eq!(screen_count, 1, "drift must not auto-commit a new screen");
+    let edge_count = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(edge_count, 0, "drift must not auto-commit an edge");
+
+    // Proposal with populated changes array.
+    let proposals: Vec<Value> = fs::read_dir(temp.path().join(".minimap/proposals"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0]["kind"], "selector_drift");
+    let changes = proposals[0]["changes"].as_array().unwrap();
+    assert!(
+        !changes.is_empty(),
+        "drift proposal must populate `changes` for default accept resolution"
+    );
+
+    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
+    assert!(journal.contains("\"outcome\":\"drift_staged\""));
+}
+
+#[test]
+fn drift_proposal_default_accept_writes_edge_to_candidate() {
+    let temp = tempfile::tempdir().unwrap();
+    // Existing screen in the graph that the drift proposal points at as candidate.
+    write_settings_screen(temp.path());
+    // A throwaway source screen file just so the source id is "real" on disk.
+    write_json(
+        &temp.path().join(".minimap/graph/screens/screen_dummy_src.json"),
+        &json!({
+            "schema_version": "minimap.screen.v1",
+            "id": "screen_dummy_src",
+            "name": "dummy",
+            "identity_hash": "sha256:dummy-src",
+            "normalized": {
+                "schema_version": "minimap.normalized_layout.v1",
+                "elements": [],
+                "role_distribution": {},
+                "element_count": 0
+            }
+        }),
+    );
+    let edge = json!({
+        "schema_version": "minimap.edge.v1",
+        "id": "edge_dummy_src__screen_settings__abcd1234",
+        "from_screen": "screen_dummy_src",
+        "to_screen": "screen_settings",
+        "intent": "drift candidate edge",
+        "action": {
+            "kind": "tap",
+            "description": "drift candidate edge",
+            "selector_candidates": [
+                {"kind": "resource_id", "value": "settings_tile", "score": 0.7}
+            ]
+        },
+        "expectations": [{"kind": "screen_reached", "screen": "screen_settings"}],
+        "learned_from": {"source": "atomic_tap"}
+    });
+    let proposal = json!({
+        "schema_version": "minimap.proposal.v1",
+        "id": "proposal-drift-abcd1234",
+        "kind": "selector_drift",
+        "reason": "fixture",
+        "candidate_screen_id": "screen_settings",
+        "from_screen_id": "screen_dummy_src",
+        "match_confidence": 0.7,
+        "identity_hash": "sha256:abcd1234deadbeef",
+        "observed_layout": {"class":"Column"},
+        "observed_normalized": {"elements": [], "role_distribution": {}, "element_count": 0},
+        "selector_candidates": [{"kind": "resource_id", "value": "settings_tile", "score": 0.7}],
+        "tap_reason": "go to settings",
+        "changes": [{"op": "add", "object": edge}]
+    });
+    write_json(
+        &temp.path().join(".minimap/proposals/proposal-drift-abcd1234.json"),
+        &proposal,
+    );
+
+    minimap(temp.path())
+        .args(["accept", "proposal-drift-abcd1234"])
+        .assert()
+        .success();
+
+    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["from_screen"], "screen_dummy_src");
+    assert_eq!(edges[0]["to_screen"], "screen_settings");
+
+    // No new screen — default accept does NOT materialize a new screen.
+    let screen_count = fs::read_dir(temp.path().join(".minimap/graph/screens"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .count();
+    assert_eq!(screen_count, 2, "default accept should not add a new screen");
+}
+
+#[test]
+fn drift_proposal_as_new_creates_screen_and_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    write_json(
+        &temp.path().join(".minimap/graph/screens/screen_dummy_src.json"),
+        &json!({
+            "schema_version": "minimap.screen.v1",
+            "id": "screen_dummy_src",
+            "name": "dummy",
+            "identity_hash": "sha256:dummy-src",
+            "normalized": {
+                "schema_version": "minimap.normalized_layout.v1",
+                "elements": [],
+                "role_distribution": {},
+                "element_count": 0
+            }
+        }),
+    );
+    let proposal_identity_hash = "sha256:deadbeefcafef00d";
+    let proposal = json!({
+        "schema_version": "minimap.proposal.v1",
+        "id": "proposal-drift-deadbeef",
+        "kind": "selector_drift",
+        "reason": "fixture",
+        "candidate_screen_id": "screen_settings",
+        "from_screen_id": "screen_dummy_src",
+        "match_confidence": 0.7,
+        "identity_hash": proposal_identity_hash,
+        "observed_layout": {"class":"Column","children":[{"class":"Text","text":"New Section Header"}]},
+        "observed_normalized": {
+            "schema_version": "minimap.normalized_layout.v1",
+            "elements": [
+                {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
+                {"role": "Text", "clickable": false, "enabled": true, "path": "0/0", "sibling_bucket": 0, "text_class": "medium"}
+            ],
+            "role_distribution": {"Column": 1, "Text": 1},
+            "element_count": 2
+        },
+        "selector_candidates": [{"kind": "resource_id", "value": "settings_tile", "score": 0.7}],
+        "tap_reason": "go to new section",
+        "changes": []
+    });
+    write_json(
+        &temp.path().join(".minimap/proposals/proposal-drift-deadbeef.json"),
+        &proposal,
+    );
+
+    minimap(temp.path())
+        .args(["accept", "proposal-drift-deadbeef", "--as-new"])
+        .assert()
+        .success();
+
+    // Expected new screen id derived from the proposal's identity_hash: screen_<first8 hex>.
+    let expected_screen_id = "screen_deadbeef";
+    let new_screen_path = temp
+        .path()
+        .join(".minimap/graph/screens")
+        .join(format!("{expected_screen_id}.json"));
+    assert!(
+        new_screen_path.exists(),
+        "accept --as-new should write {} (got: {:?})",
+        new_screen_path.display(),
+        fs::read_dir(temp.path().join(".minimap/graph/screens"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>()
+    );
+
+    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["from_screen"], "screen_dummy_src");
+    assert_eq!(edges[0]["to_screen"], expected_screen_id);
+}
+
+#[test]
+fn accept_as_new_errors_on_non_drift_proposal() {
+    let temp = tempfile::tempdir().unwrap();
+    write_settings_screen(temp.path());
+    let proposal = json!({
+        "schema_version": "minimap.proposal.v1",
+        "id": "proposal-route-foo",
+        "kind": "learned_route",
+        "reason": "fixture",
+        "changes": []
+    });
+    write_json(
+        &temp.path().join(".minimap/proposals/proposal-route-foo.json"),
+        &proposal,
+    );
+
+    let assertion = minimap(temp.path())
+        .args(["accept", "proposal-route-foo", "--as-new"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    let summary = payload["summary"]
+        .as_str()
+        .or_else(|| payload["data"]["error"]["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        summary.contains("selector_drift") && summary.contains("learned_route"),
+        "error should name both the required and actual proposal kind: {summary}"
     );
 }
 
