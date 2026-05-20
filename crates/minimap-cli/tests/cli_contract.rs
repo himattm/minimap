@@ -1054,6 +1054,114 @@ exit 2
 }
 
 #[test]
+fn tap_atomic_journal_carries_viewport_when_wm_size_seeded() {
+    let temp = tempfile::tempdir().unwrap();
+    write_home_to_article_graph(temp.path());
+    let bin = fake_bin(temp.path());
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+COUNT_FILE="$(dirname "$0")/android-count"
+COUNT=0
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
+COUNT=$((COUNT + 1))
+printf "%s" "$COUNT" > "$COUNT_FILE"
+if [ "$1" = "layout" ]; then
+  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
+    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
+  else
+    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
+  fi
+  exit 0
+fi
+exit 2
+"#,
+    );
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
+  printf 'Physical size: 1080x2400\n'
+  exit 0
+fi
+exit 2
+"#,
+    );
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "test_tag=read_article",
+            "--reason",
+            "go to article",
+        ])
+        .assert()
+        .success();
+    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["outcome"], "matched");
+    assert_eq!(entry["viewport"], json!({"width": 1080, "height": 2400}));
+}
+
+#[test]
+fn tap_atomic_journal_omits_viewport_when_wm_size_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    write_home_to_article_graph(temp.path());
+    let bin = fake_bin(temp.path());
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+COUNT_FILE="$(dirname "$0")/android-count"
+COUNT=0
+if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
+COUNT=$((COUNT + 1))
+printf "%s" "$COUNT" > "$COUNT_FILE"
+if [ "$1" = "layout" ]; then
+  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
+    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
+  else
+    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
+  fi
+  exit 0
+fi
+exit 2
+"#,
+    );
+    // Tap succeeds, but `wm size` is deliberately unsupported (falls through to exit 2).
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+  exit 0
+fi
+exit 2
+"#,
+    );
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "test_tag=read_article",
+            "--reason",
+            "go to article",
+        ])
+        .assert()
+        .success();
+    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    assert_eq!(entry["outcome"], "matched");
+    assert!(
+        entry.get("viewport").is_none() || entry["viewport"].is_null(),
+        "viewport should be absent when wm size fails: {entry}"
+    );
+}
+
+#[test]
 fn drift_proposal_default_accept_writes_edge_to_candidate() {
     let temp = tempfile::tempdir().unwrap();
     // Existing screen in the graph that the drift proposal points at as candidate.

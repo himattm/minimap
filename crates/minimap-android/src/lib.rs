@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use minimap_schemas::Viewport;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
@@ -140,6 +141,45 @@ impl<R: CommandRunner> Adb<R> {
             ],
         )
     }
+
+    pub fn display_size(&mut self) -> Result<Viewport> {
+        let result = run_checked(
+            &mut self.runner,
+            vec![
+                self.adb_bin.clone(),
+                "shell".to_string(),
+                "wm".to_string(),
+                "size".to_string(),
+            ],
+        )?;
+        parse_wm_size(&result.stdout)
+    }
+}
+
+/// Parse `adb shell wm size` output. When `Override size:` is present it wins
+/// because that is what the device actually renders at; otherwise fall back to
+/// `Physical size:`.
+pub fn parse_wm_size(stdout: &str) -> Result<Viewport> {
+    let mut physical: Option<Viewport> = None;
+    let mut override_size: Option<Viewport> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Physical size:") {
+            physical = parse_size_value(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("Override size:") {
+            override_size = parse_size_value(rest.trim());
+        }
+    }
+    override_size
+        .or(physical)
+        .context("could not parse `wm size` output")
+}
+
+fn parse_size_value(value: &str) -> Option<Viewport> {
+    let (w, h) = value.split_once('x')?;
+    let width = w.trim().parse().ok()?;
+    let height = h.trim().parse().ok()?;
+    Some(Viewport { width, height })
 }
 
 fn run_checked<R: CommandRunner>(runner: &mut R, args: Vec<String>) -> Result<CommandResult> {
@@ -185,12 +225,16 @@ pub fn tap_selector_result<AR: CommandRunner, DR: CommandRunner>(
     let layout: Value = serde_json::from_str(&command.stdout)?;
     let point = resolve_selector_point(&layout, selector)?;
     adb.tap(point)?;
+    let viewport = capture_viewport(adb);
     let mut action = json!({
         "kind": "tap",
         "path": "layout_selector",
         "selector": selector,
         "point": { "x": point.x, "y": point.y }
     });
+    if let Some(viewport) = viewport {
+        action["viewport"] = json!({ "width": viewport.width, "height": viewport.height });
+    }
     if let Some(reason) = reason {
         action["reason"] = Value::String(reason.to_string());
     }
@@ -216,14 +260,19 @@ pub fn tap_point_result<R: CommandRunner>(
     }
     let point = TapPoint { x, y };
     adb.tap(point)?;
+    let viewport = capture_viewport(adb);
+    let mut action = json!({
+        "kind": "tap",
+        "path": "coordinate",
+        "mode": mode,
+        "point": { "x": x, "y": y }
+    });
+    if let Some(viewport) = viewport {
+        action["viewport"] = json!({ "width": viewport.width, "height": viewport.height });
+    }
     Ok(json!({
         "status": "ok",
-        "action": {
-            "kind": "tap",
-            "path": "coordinate",
-            "mode": mode,
-            "point": { "x": x, "y": y }
-        },
+        "action": action,
         "metrics": {
             "layout_calls_total": 0,
             "layout_json_returned_to_agent": false,
@@ -242,21 +291,36 @@ pub fn tap_label_result<AR: CommandRunner, DR: CommandRunner>(
     let resolved = android.screen_resolve(screenshot, &format!("input tap #{label}"))?;
     let point = parse_input_tap(&resolved.stdout)?;
     adb.tap(point)?;
+    let viewport = capture_viewport(adb);
+    let mut action = json!({
+        "kind": "tap",
+        "path": "annotated_screenshot_label",
+        "label": label,
+        "screenshot": screenshot,
+        "point": { "x": point.x, "y": point.y }
+    });
+    if let Some(viewport) = viewport {
+        action["viewport"] = json!({ "width": viewport.width, "height": viewport.height });
+    }
     Ok(json!({
         "status": "ok",
-        "action": {
-            "kind": "tap",
-            "path": "annotated_screenshot_label",
-            "label": label,
-            "screenshot": screenshot,
-            "point": { "x": point.x, "y": point.y }
-        },
+        "action": action,
         "metrics": {
             "layout_calls_total": 0,
             "layout_json_returned_to_agent": false,
             "adb_taps_total": 1
         }
     }))
+}
+
+fn capture_viewport<R: CommandRunner>(adb: &mut Adb<R>) -> Option<Viewport> {
+    match adb.display_size() {
+        Ok(viewport) => Some(viewport),
+        Err(error) => {
+            eprintln!("minimap: viewport capture failed: {error}");
+            None
+        }
+    }
 }
 
 pub fn resolve_selector_point(layout: &Value, selector: &str) -> Result<TapPoint> {
@@ -406,7 +470,10 @@ mod tests {
     fn tap_selector_resolves_bounds_and_taps() {
         let layout = r#"{"children":[{"text":"Settings","bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}"#;
         let mut android = AndroidCli::new(FakeRunner::new(vec![ok(&["android"], layout)]));
-        let mut adb = Adb::new(FakeRunner::new(vec![ok(&["adb"], "")]));
+        let mut adb = Adb::new(FakeRunner::new(vec![
+            ok(&["adb"], ""),
+            ok(&["adb"], "Physical size: 1080x2400\n"),
+        ]));
         let result = tap_selector_result(
             &mut android,
             &mut adb,
@@ -415,5 +482,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["action"]["point"], json!({"x": 200, "y": 300}));
+        assert_eq!(
+            result["action"]["viewport"],
+            json!({"width": 1080, "height": 2400})
+        );
+    }
+
+    #[test]
+    fn parse_wm_size_physical_only() {
+        let viewport = parse_wm_size("Physical size: 1080x2400\n").unwrap();
+        assert_eq!(
+            viewport,
+            Viewport {
+                width: 1080,
+                height: 2400
+            }
+        );
+    }
+
+    #[test]
+    fn parse_wm_size_override_wins() {
+        let viewport =
+            parse_wm_size("Physical size: 1080x2400\nOverride size: 720x1600\n").unwrap();
+        assert_eq!(
+            viewport,
+            Viewport {
+                width: 720,
+                height: 1600
+            }
+        );
+    }
+
+    #[test]
+    fn parse_wm_size_rejects_garbage() {
+        assert!(parse_wm_size("no size here").is_err());
+    }
+
+    #[test]
+    fn adb_display_size_returns_viewport_from_runner() {
+        let mut adb = Adb::new(FakeRunner::new(vec![ok(
+            &["adb"],
+            "Physical size: 1080x2400\n",
+        )]));
+        let viewport = adb.display_size().unwrap();
+        assert_eq!(
+            viewport,
+            Viewport {
+                width: 1080,
+                height: 2400
+            }
+        );
     }
 }

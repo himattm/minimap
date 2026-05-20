@@ -29,6 +29,7 @@ This is a clean break — existing `.minimap/` trees from 0.1.x must be re-initi
 - `accept <id> --as-new` materializes a new screen from a drift proposal instead of merging with the candidate
 - `.minimap/journal.jsonl` — append-only event log with documented outcomes (`matched | new_screen | drift_staged | coord_journal_only | tap_failed | from_screen_unknown`)
 - `navigation.post_tap_settle_ms` config key controls the post-tap settle window (default 500 ms)
+- Tap actions and journal entries now carry an optional viewport (`{width, height}`) captured from `adb shell wm size`, enabling cross-device reusability checks
 
 ### Changed
 

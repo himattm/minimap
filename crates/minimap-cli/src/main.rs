@@ -13,8 +13,8 @@ use minimap_repo::{
     stage_proposal_value, AcceptResolution, LEGACY_MINIMAP_MESSAGE,
 };
 use minimap_schemas::{
-    canonical_json, JournalEntry, MinimapResult, NavigationEdge, JOURNAL_ENTRY_SCHEMA_VERSION,
-    RESULT_SCHEMA_VERSION, ROUTE_SCHEMA_VERSION,
+    canonical_json, JournalEntry, MinimapResult, NavigationEdge, Viewport,
+    JOURNAL_ENTRY_SCHEMA_VERSION, RESULT_SCHEMA_VERSION, ROUTE_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -392,7 +392,14 @@ fn tap_atomic(
         Err(error) => {
             append_journal_entry(
                 root,
-                &journal_entry(from_screen_id.clone(), None, None, reason.as_deref(), "tap_failed"),
+                &journal_entry(
+                    from_screen_id.clone(),
+                    None,
+                    None,
+                    reason.as_deref(),
+                    "tap_failed",
+                    None,
+                ),
             )?;
             print_json(&json!({
                 "schema_version": RESULT_SCHEMA_VERSION,
@@ -415,6 +422,7 @@ fn tap_atomic(
                 None,
                 reason.as_deref(),
                 "coord_journal_only",
+                viewport_from_action(&tap_value["action"]),
             ),
         )?;
         print_json(&json!({
@@ -445,6 +453,7 @@ fn tap_atomic(
                 None,
                 reason.as_deref(),
                 "from_screen_unknown",
+                viewport_from_action(&tap_value["action"]),
             ),
         )?;
         print_json(&json!({
@@ -473,6 +482,7 @@ fn tap_atomic(
                     Some(to_screen_id.clone()),
                     reason.as_deref(),
                     "matched",
+                    viewport_from_action(&tap_value["action"]),
                 ),
             )?;
             print_json(&json!({
@@ -499,6 +509,7 @@ fn tap_atomic(
                     Some(to_screen_id.clone()),
                     reason.as_deref(),
                     "new_screen",
+                    viewport_from_action(&tap_value["action"]),
                 ),
             )?;
             print_json(&json!({
@@ -525,6 +536,7 @@ fn tap_atomic(
                     candidate_screen_id.clone(),
                     reason.as_deref(),
                     "drift_staged",
+                    viewport_from_action(&tap_value["action"]),
                 ),
             )?;
             print_json(&json!({
@@ -714,6 +726,7 @@ fn journal_entry(
     to_screen_id: Option<String>,
     reason: Option<&str>,
     outcome: &str,
+    viewport: Option<Viewport>,
 ) -> JournalEntry {
     JournalEntry {
         schema_version: JOURNAL_ENTRY_SCHEMA_VERSION.to_string(),
@@ -726,7 +739,13 @@ fn journal_entry(
         to_screen_id,
         reason: reason.map(str::to_string),
         outcome: outcome.to_string(),
+        viewport,
     }
+}
+
+fn viewport_from_action(action: &Value) -> Option<Viewport> {
+    serde_json::from_value::<Option<Viewport>>(action.get("viewport").cloned().unwrap_or(Value::Null))
+        .unwrap_or(None)
 }
 
 fn parse_point(point: &str) -> Result<(i64, i64)> {

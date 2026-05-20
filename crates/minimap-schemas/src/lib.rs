@@ -11,6 +11,12 @@ pub const PROPOSAL_SCHEMA_VERSION: &str = "minimap.proposal.v1";
 pub const RESULT_SCHEMA_VERSION: &str = "minimap.result.v1";
 pub const JOURNAL_ENTRY_SCHEMA_VERSION: &str = "minimap.journal_entry.v1";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Viewport {
+    pub width: i64,
+    pub height: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct GraphContext(pub BTreeMap<String, Value>);
 
@@ -160,6 +166,10 @@ pub struct JournalEntry {
     /// not match any committed screen, so the tap was executed but no edge was
     /// grown — re-run `minimap layout` (or commit the current screen) to get oriented.
     pub outcome: String,
+    /// Best-effort device viewport captured at tap time. `None` when `adb shell wm size`
+    /// fails or was not available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<Viewport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
