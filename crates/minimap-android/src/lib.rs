@@ -327,16 +327,22 @@ pub fn resolve_selector_point(layout: &Value, selector: &str) -> Result<TapPoint
     let (key, expected) = selector
         .split_once('=')
         .context("selectors must use key=value syntax")?;
-    let key = match key.trim() {
-        "content_desc" | "content_description" | "desc" => "contentDescription",
-        "id" | "resource_id" => "resourceId",
-        "test_tag" => "testTag",
-        other => other,
+    // `android layout` emits hyphenated keys (content-desc, resource-id); legacy
+    // UIAutomator dumps use camelCase. Try both so we don't break either shape.
+    let candidates: Vec<&str> = match key.trim() {
+        "content_desc" | "content_description" | "desc" => {
+            vec!["content-desc", "contentDescription"]
+        }
+        "id" | "resource_id" => vec!["resource-id", "resourceId"],
+        "test_tag" => vec!["testTag", "test-tag"],
+        other => vec![other],
     };
     let expected = expected.trim();
     for node in walk_nodes(layout) {
-        if node.get(key).and_then(Value::as_str) == Some(expected) {
-            return center_of(node).context("matched node has no tap bounds");
+        for k in &candidates {
+            if node.get(*k).and_then(Value::as_str) == Some(expected) {
+                return center_of(node).context("matched node has no tap bounds");
+            }
         }
     }
     bail!("Selector not found: {selector}")
@@ -362,6 +368,16 @@ fn walk_nodes(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
 }
 
 fn center_of(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
+    if let Some(point) = bounds_center(node) {
+        return Some(point);
+    }
+    // Real `android layout` output exposes precomputed center as a "[x,y]" string.
+    node.get("center")
+        .and_then(Value::as_str)
+        .and_then(parse_center_string)
+}
+
+fn bounds_center(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
     match node.get("bounds")? {
         Value::Object(bounds) => {
             let left = number(bounds, &["left", "x", "minX"])?;
@@ -391,6 +407,15 @@ fn center_of(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
         }
         _ => None,
     }
+}
+
+fn parse_center_string(s: &str) -> Option<TapPoint> {
+    let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let (x, y) = inner.split_once(',')?;
+    Some(TapPoint {
+        x: x.trim().parse().ok()?,
+        y: y.trim().parse().ok()?,
+    })
 }
 
 fn number(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
@@ -486,6 +511,40 @@ mod tests {
             result["action"]["viewport"],
             json!({"width": 1080, "height": 2400})
         );
+    }
+
+    #[test]
+    fn tap_selector_resolves_real_cli_shape() {
+        // Mirrors what `android layout` actually emits: flat array of nodes
+        // with hyphenated keys and a stringified center.
+        let layout = r#"[{"content-desc":"Settings","center":"[1006,147]","key":1},{"text":"Commute","center":"[585,659]","key":2}]"#;
+        let mut android = AndroidCli::new(FakeRunner::new(vec![ok(&["android"], layout)]));
+        let mut adb = Adb::new(FakeRunner::new(vec![
+            ok(&["adb"], ""),
+            ok(&["adb"], "Physical size: 1080x2400\n"),
+        ]));
+        let result = tap_selector_result(
+            &mut android,
+            &mut adb,
+            "content_desc=Settings",
+            Some("open settings"),
+        )
+        .unwrap();
+        assert_eq!(result["action"]["point"], json!({"x": 1006, "y": 147}));
+    }
+
+    #[test]
+    fn parse_center_string_parses_bracketed_pair() {
+        assert_eq!(
+            parse_center_string("[1006,147]").unwrap(),
+            TapPoint { x: 1006, y: 147 }
+        );
+        assert_eq!(
+            parse_center_string(" [ 12 , 34 ] ").unwrap(),
+            TapPoint { x: 12, y: 34 }
+        );
+        assert!(parse_center_string("1006,147").is_none());
+        assert!(parse_center_string("[abc,def]").is_none());
     }
 
     #[test]
