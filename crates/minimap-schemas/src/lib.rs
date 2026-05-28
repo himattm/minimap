@@ -3,13 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub const CONFIG_SCHEMA_VERSION: &str = "minimap.config.v1";
-pub const SCREEN_SCHEMA_VERSION: &str = "minimap.screen.v1";
+pub const CONFIG_SCHEMA_VERSION: &str = "minimap.config.v2";
+pub const PLACE_SCHEMA_VERSION: &str = "minimap.place.v1";
 pub const EDGE_SCHEMA_VERSION: &str = "minimap.edge.v1";
-pub const ROUTE_SCHEMA_VERSION: &str = "minimap.route.v1";
-pub const PROPOSAL_SCHEMA_VERSION: &str = "minimap.proposal.v1";
 pub const RESULT_SCHEMA_VERSION: &str = "minimap.result.v1";
-pub const JOURNAL_ENTRY_SCHEMA_VERSION: &str = "minimap.journal_entry.v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Viewport {
@@ -17,205 +14,125 @@ pub struct Viewport {
     pub height: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct GraphContext(pub BTreeMap<String, Value>);
-
-impl GraphContext {
-    pub fn satisfies(&self, guard: &BTreeMap<String, Value>) -> bool {
-        self.mismatches(guard).is_empty()
-    }
-
-    pub fn mismatches(&self, guard: &BTreeMap<String, Value>) -> Vec<String> {
-        guard
-            .iter()
-            .filter_map(|(key, required)| {
-                if value_matches(self.0.get(key), required) {
-                    None
-                } else {
-                    Some(key.clone())
-                }
-            })
-            .collect()
-    }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Point {
+    pub x: i64,
+    pub y: i64,
 }
 
-fn value_matches(current: Option<&Value>, required: &Value) -> bool {
-    if required.is_null() || required == "any" {
-        return true;
-    }
-    match required {
-        Value::Array(values) => values.iter().any(|value| value_matches(current, value)),
-        Value::String(required) if required.ends_with("_or_unknown") => {
-            let base = required.trim_end_matches("_or_unknown");
-            current == Some(&Value::String(base.to_string()))
-                || current == Some(&Value::String("unknown".to_string()))
-        }
-        Value::String(required) if required == "unknown" => {
-            current == Some(&Value::String("unknown".to_string()))
-        }
-        _ => current == Some(required),
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppProfile {
+    #[serde(default)]
+    pub android_package: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ScreenNode {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MinimapConfig {
     pub schema_version: String,
-    /// Stable handle (`screen_<hash8>`); edges reference this. Never renamed.
-    pub id: String,
-    /// Best-effort auto-derived display name. Mutable — `screen rename` rewrites it.
-    pub name: String,
+    pub active_app_profile: String,
+    pub app_profiles: BTreeMap<String, AppProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Selector {
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StaticText {
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Fingerprint {
+    #[serde(default)]
+    pub selectors: Vec<Selector>,
+    #[serde(default)]
+    pub static_text: Vec<StaticText>,
+    #[serde(default)]
+    pub roles: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaceBaseline {
     pub identity_hash: String,
-    #[serde(default)]
-    pub context_guard: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    #[serde(default)]
-    pub match_profile: Value,
-    #[serde(default)]
-    pub checks: Vec<Value>,
-    #[serde(default)]
-    pub source: Value,
-    #[serde(default)]
-    pub normalized: Option<Value>,
+    pub fingerprint: Fingerprint,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TapRecipe {
-    #[serde(default = "tap_kind")]
-    pub kind: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub selector_candidates: Vec<SelectorCandidate>,
-    #[serde(default)]
-    pub tap_cache: Option<Value>,
-}
-
-fn tap_kind() -> String {
-    "tap".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SelectorCandidate {
-    pub kind: String,
-    #[serde(default)]
-    pub value: Option<String>,
-    #[serde(default)]
-    pub score: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NavigationEdge {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Place {
     pub schema_version: String,
     pub id: String,
-    /// Stable `ScreenNode.id` reference (e.g. `screen_<hash8>`). Never a display name.
-    pub from_screen: String,
-    /// Stable `ScreenNode.id` reference (e.g. `screen_<hash8>`). Never a display name.
-    pub to_screen: String,
-    pub action: TapRecipe,
+    pub slug: String,
+    pub label: String,
+    pub baseline: PlaceBaseline,
     #[serde(default)]
-    pub intent: Option<String>,
-    #[serde(default)]
-    pub context_guard: BTreeMap<String, Value>,
-    #[serde(default)]
-    pub expectations: Vec<Value>,
-    #[serde(default)]
-    pub learned_from: Value,
-    #[serde(default)]
-    pub confidence_model: Value,
+    pub variants: Vec<PlaceBaseline>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Route {
-    pub schema_version: String,
-    pub name: String,
-    pub target: Value,
-    #[serde(default)]
-    pub from: Option<Value>,
-    #[serde(default)]
-    pub triggers: Vec<Value>,
-    #[serde(default)]
-    pub aliases: Vec<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EdgeEndpoint {
+    pub id: String,
+    pub slug: String,
 }
 
-impl Route {
-    pub fn target_screen(&self) -> Option<&str> {
-        self.target.get("screen").and_then(Value::as_str)
-    }
-
-    pub fn from_screen(&self) -> Option<&str> {
-        self.from.as_ref()?.get("screen").and_then(Value::as_str)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct JournalEntry {
-    pub schema_version: String,
-    pub ts: i64,
-    #[serde(default)]
-    pub from_screen_id: Option<String>,
-    #[serde(default)]
-    pub edge_id: Option<String>,
-    #[serde(default)]
-    pub to_screen_id: Option<String>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// One of the documented outcome strings emitted by atomic tap:
-    /// `matched` | `new_screen` | `drift_staged` | `coord_journal_only` | `tap_failed`
-    /// | `from_screen_unknown`. `from_screen_unknown` means the pre-tap layout did
-    /// not match any committed screen, so the tap was executed but no edge was
-    /// grown — re-run `minimap layout` (or commit the current screen) to get oriented.
-    pub outcome: String,
-    /// Best-effort device viewport captured at tap time. `None` when `adb shell wm size`
-    /// fails or was not available.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionStep {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<Selector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point: Option<Point>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport: Option<Viewport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Proposal {
+impl ActionStep {
+    pub fn is_geometry(&self) -> bool {
+        self.point.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Edge {
     pub schema_version: String,
     pub id: String,
-    pub kind: String,
-    #[serde(default)]
-    pub changes: Vec<Value>,
-    #[serde(default)]
-    pub reason: Option<String>,
+    pub from: EdgeEndpoint,
+    pub to: EdgeEndpoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    pub recipe: Vec<ActionStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MinimapResult {
     pub schema_version: String,
     pub status: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default)]
     pub data: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_action: Option<String>,
 }
 
 impl MinimapResult {
-    pub fn ok(summary: impl Into<String>, data: Value) -> Self {
+    pub fn new(status: impl Into<String>, summary: impl Into<String>, data: Value) -> Self {
         Self {
             schema_version: RESULT_SCHEMA_VERSION.to_string(),
-            status: "ok".to_string(),
+            status: status.into(),
             summary: Some(summary.into()),
             data,
             recommended_action: None,
         }
     }
 
-    pub fn context_mismatch(mismatches: Vec<String>) -> Self {
-        Self {
-            schema_version: RESULT_SCHEMA_VERSION.to_string(),
-            status: "context_mismatch".to_string(),
-            summary: Some("current context does not satisfy the graph guard".to_string()),
-            data: serde_json::json!({ "mismatches": mismatches }),
-            recommended_action: Some(
-                "establish required context or choose another route variant".to_string(),
-            ),
-        }
+    pub fn with_recommendation(mut self, recommendation: impl Into<String>) -> Self {
+        self.recommended_action = Some(recommendation.into());
+        self
     }
 }
 
@@ -254,19 +171,6 @@ pub fn sort_json(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn context_guard_accepts_or_unknown() {
-        let context = GraphContext(BTreeMap::from([(
-            "auth_state".to_string(),
-            Value::String("unknown".to_string()),
-        )]));
-        let guard = BTreeMap::from([(
-            "auth_state".to_string(),
-            Value::String("logged_in_or_unknown".to_string()),
-        )]);
-        assert!(context.satisfies(&guard));
-    }
 
     #[test]
     fn canonical_json_sorts_keys() {

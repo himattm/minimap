@@ -142,6 +142,51 @@ impl<R: CommandRunner> Adb<R> {
         )
     }
 
+    pub fn back(&mut self) -> Result<CommandResult> {
+        run_checked(
+            &mut self.runner,
+            vec![
+                self.adb_bin.clone(),
+                "shell".to_string(),
+                "input".to_string(),
+                "keyevent".to_string(),
+                "KEYCODE_BACK".to_string(),
+            ],
+        )
+    }
+
+    pub fn swipe(
+        &mut self,
+        start_x: i64,
+        start_y: i64,
+        end_x: i64,
+        end_y: i64,
+        duration_ms: i64,
+    ) -> Result<CommandResult> {
+        run_checked(
+            &mut self.runner,
+            vec![
+                self.adb_bin.clone(),
+                "shell".to_string(),
+                "input".to_string(),
+                "swipe".to_string(),
+                start_x.to_string(),
+                start_y.to_string(),
+                end_x.to_string(),
+                end_y.to_string(),
+                duration_ms.to_string(),
+            ],
+        )
+    }
+
+    pub fn serial(&mut self) -> Result<String> {
+        let result = run_checked(
+            &mut self.runner,
+            vec![self.adb_bin.clone(), "get-serialno".to_string()],
+        )?;
+        Ok(result.stdout.trim().to_string())
+    }
+
     pub fn display_size(&mut self) -> Result<Viewport> {
         let result = run_checked(
             &mut self.runner,
