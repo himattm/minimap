@@ -137,6 +137,10 @@ minimap back
 minimap go search
 ```
 
+If more than one device or emulator is attached, pass `--serial <SERIAL>` on
+any command (or set `ANDROID_SERIAL`) so every `adb` and `android` call targets
+a single device; `minimap doctor` flags ambiguous multi-device setups.
+
 For broader manual validation, clone the public
 [Android Compose samples](https://github.com/android/compose-samples) and build
 one of its apps (Jetsnack, JetNews, or Jetchat):

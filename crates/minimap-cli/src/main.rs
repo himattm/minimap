@@ -40,6 +40,9 @@ struct Cli {
     quiet: bool,
     #[arg(long = "no-color")]
     no_color: bool,
+    /// Android device serial to target when more than one device is attached.
+    #[arg(long, global = true, env = "ANDROID_SERIAL")]
+    serial: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -162,6 +165,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     let root = PathBuf::from(".");
+    let serial = cli.serial;
     match cli.command {
         Commands::Init {
             dry_run,
@@ -184,7 +188,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Commands::Doctor => {
-            let result = doctor(&root);
+            let result = doctor(&root, serial.as_deref());
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
             Ok(code)
@@ -193,8 +197,8 @@ fn run(cli: Cli) -> Result<i32> {
             label,
             allow_duplicate_label,
         } => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
+            let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
+            let mut adb = Adb::new(SubprocessRunner, serial);
             let result = whereami_result(
                 &root,
                 &mut android,
@@ -208,8 +212,8 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(code)
         }
         Commands::Go { target } => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
+            let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
+            let mut adb = Adb::new(SubprocessRunner, serial);
             let result = go_result(&root, &mut android, &mut adb, &target)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
@@ -224,8 +228,8 @@ fn run(cli: Cli) -> Result<i32> {
             reason,
             allow_duplicate_label,
         } => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
+            let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
+            let mut adb = Adb::new(SubprocessRunner, serial);
             let result = tap_result(
                 &root,
                 &mut android,
@@ -245,24 +249,24 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(code)
         }
         Commands::Scroll { direction } => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
+            let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
+            let mut adb = Adb::new(SubprocessRunner, serial);
             let result = scroll_result(&root, &mut android, &mut adb, &direction)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
             Ok(code)
         }
         Commands::Back => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
+            let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
+            let mut adb = Adb::new(SubprocessRunner, serial);
             let result = back_result(&root, &mut android, &mut adb)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
             Ok(code)
         }
         Commands::Layout { diff } => {
-            let mut android = AndroidCli::new(SubprocessRunner);
-            let mut adb = Adb::new(SubprocessRunner);
+            let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
+            let mut adb = Adb::new(SubprocessRunner, serial);
             let result = layout_result(&root, &mut android, &mut adb, diff)?;
             print_json(&result);
             Ok(0)
@@ -1397,12 +1401,27 @@ fn execute_recipe<AR: CommandRunner, DR: CommandRunner>(
     Ok(())
 }
 
-fn doctor(root: &Path) -> Value {
+fn doctor(root: &Path, serial: Option<&str>) -> Value {
     let repo_checks = validate_graph(root);
     let repo_ok = repo_checks.iter().all(|check| check["status"] == "pass");
     let android_ok = command_on_path("android");
     let adb_ok = command_on_path("adb");
-    let device_ok = adb_ok && adb_device_ready();
+    // With no serial resolved, two or more attached devices make every bare
+    // adb/android call ambiguous, so fail the device check with a fix instead
+    // of surfacing adb's opaque "more than one device" error.
+    let multi_device = serial.is_none() && adb_ok && adb_devices_in_device_state() > 1;
+    let device_ok = adb_ok && !multi_device && adb_device_ready(serial);
+    let mut device_check = json!({
+        "name": "device",
+        "status": if device_ok { "pass" } else { "fail" }
+    });
+    if multi_device {
+        device_check["hint"] =
+            json!("multiple devices attached; pass --serial or set ANDROID_SERIAL");
+    }
+    if let Some(serial) = serial {
+        device_check["serial"] = json!(serial);
+    }
     json!({
         "schema_version": RESULT_SCHEMA_VERSION,
         "status": if repo_ok && android_ok && adb_ok && device_ok { "ok" } else { "config_error" },
@@ -1414,7 +1433,7 @@ fn doctor(root: &Path) -> Value {
             "environment": [
                 {"name": "android", "status": if android_ok { "pass" } else { "fail" }},
                 {"name": "adb", "status": if adb_ok { "pass" } else { "fail" }},
-                {"name": "device", "status": if device_ok { "pass" } else { "fail" }}
+                device_check
             ]
         }
     })
@@ -1426,9 +1445,32 @@ fn command_on_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn adb_device_ready() -> bool {
-    let output = ProcessCommand::new("adb").arg("get-state").output();
+fn adb_device_ready(serial: Option<&str>) -> bool {
+    let mut command = ProcessCommand::new("adb");
+    if let Some(serial) = serial {
+        command.args(["-s", serial]);
+    }
+    let output = command.arg("get-state").output();
     matches!(output, Ok(output) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "device")
+}
+
+/// Count attached devices in the `device` state from `adb devices` output
+/// (lines after the header look like `emulator-5554\tdevice`).
+fn adb_devices_in_device_state() -> usize {
+    let Ok(output) = ProcessCommand::new("adb").arg("devices").output() else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .skip(1)
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next().is_some() && fields.next() == Some("device")
+        })
+        .count()
 }
 
 fn place_from_label(label: &str, baseline: &PlaceBaseline) -> Place {
@@ -1974,7 +2016,7 @@ mod tests {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&mut self, args: &[String]) -> Result<CommandResult> {
+        fn run(&mut self, args: &[String], _env: &[(String, String)]) -> Result<CommandResult> {
             if args.iter().any(|arg| arg == "get-serialno") {
                 if let Some(serial) = &self.serial {
                     return Ok(CommandResult {
@@ -1995,9 +2037,12 @@ mod tests {
     }
 
     fn fake_adb(serial: Option<&str>) -> Adb<FakeRunner> {
-        Adb::new(FakeRunner {
-            serial: serial.map(str::to_string),
-        })
+        Adb::new(
+            FakeRunner {
+                serial: serial.map(str::to_string),
+            },
+            None,
+        )
     }
 
     fn endpoint(slug: &str) -> EdgeEndpoint {

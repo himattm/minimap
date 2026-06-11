@@ -17,7 +17,7 @@ minimap-core = { version = "0.2.0", path = "../minimap-core" }
 minimap-graph = { version = "0.2.0", path = "../minimap-graph" }
 minimap-repo = { version = "0.2.0", path = "../minimap-repo" }
 minimap-schemas = { version = "0.2.0", path = "../minimap-schemas" }
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 serde_json.workspace = true
 sha2.workspace = true
 

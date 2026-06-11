@@ -1262,10 +1262,171 @@ fn whereami_clears_stale_session_pointing_at_missing_place() {
     assert_eq!(count, "2");
 }
 
+#[test]
+fn serial_flag_threads_serial_through_every_adb_and_android_call() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    // Both fakes exit 1 unless the serial arrives: adb requires `-s` before
+    // every subcommand and android requires `--device=` on layout, so any
+    // serial-less call fails the whole flow.
+    write_android_layout_script_expect_serial(&bin, &["home", "home", "search"], "emulator-5554");
+    write_adb_script_expect_serial(&bin, "emulator-5554");
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home", "--serial", "emulator-5554"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--point",
+            "150,300",
+            "--label",
+            "search",
+            "--serial",
+            "emulator-5554",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["from"], "home");
+    assert_eq!(payload["data"]["to"], "search");
+}
+
+#[test]
+fn android_serial_env_threads_serial_like_the_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script_expect_serial(&bin, &["home", "home", "search"], "emulator-5554");
+    write_adb_script_expect_serial(&bin, "emulator-5554");
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .env("ANDROID_SERIAL", "emulator-5554")
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .env("ANDROID_SERIAL", "emulator-5554")
+        .args(["tap", "--point", "150,300", "--label", "search"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["to"], "search");
+}
+
+#[test]
+fn configured_serial_short_circuits_get_serialno_for_session_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script_expect_serial(&bin, &["home", "home"], "emulator-5554");
+    // This fake's `get-serialno` always exits 1: the session cache can only
+    // work if the configured serial is returned without shelling out.
+    write_adb_script_expect_serial(&bin, "emulator-5554");
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home", "--serial", "emulator-5554"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--serial", "emulator-5554"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["place"]["slug"], "home");
+    assert_eq!(payload["cache"]["hit"], true);
+    assert_eq!(payload["metrics"]["layout_calls_total"], 0);
+    // No second Android layout capture happened.
+    let count = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count, "1");
+}
+
+#[test]
+fn doctor_flags_multiple_devices_without_serial_and_targets_one_with_serial() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_two_devices(&bin);
+
+    // No serial resolved: two attached devices are a config error with a hint.
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor"])
+        .assert()
+        // config_error routes through exit_code_for_status -> 7, matching whereami/go.
+        .code(7);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "config_error");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["device_ok"], false);
+    assert_eq!(payload["repo_ok"], true);
+    let device = &payload["checks"]["environment"][2];
+    assert_eq!(device["name"], "device");
+    assert_eq!(device["status"], "fail");
+    assert_eq!(
+        device["hint"],
+        "multiple devices attached; pass --serial or set ANDROID_SERIAL"
+    );
+
+    // Targeting one device by serial restores a healthy doctor.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor", "--serial", "emulator-5554"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["device_ok"], true);
+    let device = &payload["checks"]["environment"][2];
+    assert_eq!(device["status"], "pass");
+    assert_eq!(device["serial"], "emulator-5554");
+    assert!(device.get("hint").is_none());
+}
+
 fn minimap(cwd: &Path) -> Command {
     let mut command = Command::cargo_bin("minimap").unwrap();
     command.current_dir(cwd);
     command.env("MINIMAP_ACTION_SETTLE_MS", "0");
+    // Keep an ambient ANDROID_SERIAL on the host from leaking into tests that
+    // exercise the serial-less default behavior.
+    command.env_remove("ANDROID_SERIAL");
     command
 }
 
@@ -1281,10 +1442,33 @@ fn prepend_path(bin: &Path) -> String {
 }
 
 fn write_android_layout_script(bin: &Path, sequence: &[&str]) {
+    write_android_layout_script_with_guard(bin, sequence, "");
+}
+
+/// Fake `android` that exits 1 unless `layout` invocations carry
+/// `--device=<serial>`, proving the configured serial reaches the layout CLI.
+fn write_android_layout_script_expect_serial(bin: &Path, sequence: &[&str], serial: &str) {
+    let guard = format!(
+        r#"if [ "$1" = "layout" ]; then
+  FOUND=no
+  for ARG in "$@"; do
+    if [ "$ARG" = "--device={serial}" ]; then FOUND=yes; fi
+  done
+  if [ "$FOUND" != "yes" ]; then
+    echo "expected --device={serial} on android layout, got: $*" >&2
+    exit 1
+  fi
+fi
+"#
+    );
+    write_android_layout_script_with_guard(bin, sequence, &guard);
+}
+
+fn write_android_layout_script_with_guard(bin: &Path, sequence: &[&str], guard: &str) {
     let sequence = sequence.join(" ");
     let body = format!(
         r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
+{guard}COUNT_FILE="$(dirname "$0")/android-count"
 COUNT=0
 if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
 COUNT=$((COUNT + 1))
@@ -1403,6 +1587,61 @@ if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
 fi
 if [ "$1" = "shell" ] && [ "$2" = "input" ]; then
   exit 0
+fi
+exit 2
+"#,
+    );
+}
+
+/// Fake `adb` that exits 1 unless every invocation starts with `-s <serial>`,
+/// proving the serial is threaded into each adb call. `get-serialno` always
+/// fails so a configured serial must short-circuit it (cache paths included).
+fn write_adb_script_expect_serial(bin: &Path, serial: &str) {
+    let body = format!(
+        r#"#!/bin/sh
+if [ "$1" != "-s" ] || [ "$2" != "{serial}" ]; then
+  echo "expected -s {serial}, got: $*" >&2
+  exit 1
+fi
+shift 2
+if [ "$1" = "get-state" ]; then
+  printf 'device\n'
+  exit 0
+fi
+if [ "$1" = "get-serialno" ]; then
+  echo "get-serialno must never run when a serial is configured" >&2
+  exit 1
+fi
+if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
+  printf 'Physical size: 1080x2400\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "input" ]; then
+  exit 0
+fi
+exit 2
+"#
+    );
+    write_executable(&bin.join("adb"), &body);
+}
+
+/// Fake `adb` with two attached devices: bare `get-state` fails the way real
+/// adb does with multiple devices, while `-s emulator-5554 get-state` succeeds.
+fn write_adb_script_two_devices(bin: &Path) {
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n'
+  exit 0
+fi
+if [ "$1" = "-s" ] && [ "$2" = "emulator-5554" ] && [ "$3" = "get-state" ]; then
+  printf 'device\n'
+  exit 0
+fi
+if [ "$1" = "get-state" ]; then
+  echo 'adb: more than one device/emulator' >&2
+  exit 1
 fi
 exit 2
 "#,
