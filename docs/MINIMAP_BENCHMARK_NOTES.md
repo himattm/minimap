@@ -300,6 +300,16 @@ Current wall-clock conclusion:
 - Next speed work should target Android layout latency, because layout capture
   dominates every measured path.
 
+Caveat on the replay win: the fastest `go` measurements above are an immediate
+replay after learning, which is a verified-session fast path — the source place
+is still cached from the just-completed observation, so `go` skips
+current-place rediscovery. Post-TTL replay (after the `30s` verified-session
+cache expires, or in a fresh process) does not get that fast path. It must
+re-observe the current place and confirm the source place's stored fingerprint
+still matches before replaying the edge, so it pays an extra Android layout call
+and only succeeds if the app is actually at the expected place. Read the replay
+win as a hot-session property, not a pure graph property.
+
 Measured multi-step wall-clock comparison:
 
 | Path | Raw agent commands | Raw layout dumps | Raw nodes exposed | Raw bytes | Raw wall-clock | Minimap commands | Minimap bytes | Minimap wall-clock | Speed delta |
@@ -507,8 +517,8 @@ actual command behavior and graph writes.
 | Existing place grew | `whereami --label home` returned `known_changed` | `place_home.json` gained 1 variant; no edge churn |
 | New option opens new screen | first tap returned `needs_label`; `whereami --label beta-settings` committed it | new `place_beta-settings.json` and `edge_home_beta-settings_tap_text_Beta.json` |
 | Known route, destination changed | `go cart` succeeded | `place_cart.json` gained 1 variant; existing edge reused |
-| Known selector renamed | `go chips-detail` returned `config_error` for `text=Chips`; repaired with `text=Potato Chips` | `place_home.json` gained 1 variant; new replacement edge added; old edge retained |
-| Known option removed | `go chips-detail` returned `config_error` for `text=Chips` | `place_home.json` gained 1 variant; no new edge |
+| Known selector renamed | `go chips-detail` returned `action_failed` (exit 2) for `text=Chips`; repaired with `text=Potato Chips` | `place_home.json` gained 1 variant; new replacement edge added; old edge retained |
+| Known option removed | `go chips-detail` returned `action_failed` (exit 2) for `text=Chips` | `place_home.json` gained 1 variant; no new edge |
 
 Product findings from the smoke:
 
@@ -519,9 +529,13 @@ Product findings from the smoke:
   destination variant.
 - New paths are handled safely: unknown destination without a label produces
   `needs_label`, then the label commit creates one place and one edge.
-- Broken selectors are surfaced as `config_error`. The agent can repair by
-  using current layout evidence and recording a new edge, but this path should
-  be measured separately from successful known-route replay.
+- Broken selectors (and viewport-mismatch or app-change failures) during `go`
+  are now surfaced as `action_failed` (exit 2) rather than `config_error` (exit
+  7); `config_error` is reserved for genuine repo/config problems. Overlays that
+  block the action may instead surface as `blocked_by_overlay`. The agent can
+  repair a broken selector by using current layout evidence and recording a new
+  edge, but this path should be measured separately from successful known-route
+  replay.
 
 ## Talk/Post Narrative
 

@@ -63,8 +63,9 @@ pub fn resolve_path(
     }
 
     let mut skipped_edges = Vec::new();
+    let all_edges = graph.edges.values().cloned().collect::<Vec<_>>();
     let path = shortest_compatible_path(
-        &graph.edges.values().cloned().collect::<Vec<_>>(),
+        &all_edges,
         current_place_id,
         &target_place.id,
         viewport,
@@ -79,13 +80,23 @@ pub fn resolve_path(
             edges,
             skipped_edges,
         },
-        None if !skipped_edges.is_empty() => PathPlan {
-            status: "no_compatible_path".to_string(),
-            target_slug,
-            current_slug,
-            edges: Vec::new(),
-            skipped_edges,
-        },
+        // The target is reachable when viewport compatibility is ignored, so a
+        // path exists but cannot be replayed on this device.
+        None if target_reachable_ignoring_viewport(
+            &all_edges,
+            current_place_id,
+            &target_place.id,
+        ) =>
+        {
+            PathPlan {
+                status: "no_compatible_path".to_string(),
+                target_slug,
+                current_slug,
+                edges: Vec::new(),
+                skipped_edges,
+            }
+        }
+        // No path exists at all, regardless of viewport.
         None => PathPlan {
             status: "no_known_path".to_string(),
             target_slug,
@@ -94,6 +105,24 @@ pub fn resolve_path(
             skipped_edges,
         },
     }
+}
+
+/// Plain BFS over ALL edges (no viewport compatibility filter) to decide
+/// whether the target is structurally reachable from the start at all.
+fn target_reachable_ignoring_viewport(edges: &[Edge], start: &str, target: &str) -> bool {
+    let mut queue = VecDeque::from([start.to_string()]);
+    let mut visited = BTreeSet::from([start.to_string()]);
+    while let Some(place) = queue.pop_front() {
+        if place == target {
+            return true;
+        }
+        for edge in edges.iter().filter(|edge| edge.from.id == place) {
+            if visited.insert(edge.to.id.clone()) {
+                queue.push_back(edge.to.id.clone());
+            }
+        }
+    }
+    false
 }
 
 fn shortest_compatible_path(
@@ -245,5 +274,47 @@ mod tests {
         let plan = resolve_path(&graph, "settings", "place_home", None);
         assert_eq!(plan.status, "ok");
         assert_eq!(plan.edges[0].id, "edge_home__settings__selector");
+    }
+
+    #[test]
+    fn unreachable_target_reports_no_known_path_despite_unrelated_skipped_edge() {
+        // `inbox` has no incoming edges, so it is structurally unreachable.
+        // An unrelated viewport-incompatible geometry edge exists elsewhere
+        // (home -> settings) and gets skipped during traversal. The status
+        // must still be "no_known_path" because no path to the target exists
+        // even when viewport compatibility is ignored.
+        let graph = Graph {
+            places: BTreeMap::from([
+                ("place_home".to_string(), place("home")),
+                ("place_settings".to_string(), place("settings")),
+                ("place_inbox".to_string(), place("inbox")),
+            ]),
+            edges: BTreeMap::from([(
+                "edge_home__settings__geo".to_string(),
+                edge("edge_home__settings__geo", "home", "settings", true),
+            )]),
+        };
+        let plan = resolve_path(&graph, "inbox", "place_home", None);
+        assert_eq!(plan.status, "no_known_path");
+    }
+
+    #[test]
+    fn target_reachable_only_via_incompatible_geometry_reports_no_compatible_path() {
+        // The only path home -> settings is a geometry edge whose viewport does
+        // not match the requested (None) viewport, so it is skipped. A path
+        // exists when viewport is ignored, so the status is "no_compatible_path".
+        let graph = Graph {
+            places: BTreeMap::from([
+                ("place_home".to_string(), place("home")),
+                ("place_settings".to_string(), place("settings")),
+            ]),
+            edges: BTreeMap::from([(
+                "edge_home__settings__geo".to_string(),
+                edge("edge_home__settings__geo", "home", "settings", true),
+            )]),
+        };
+        let plan = resolve_path(&graph, "settings", "place_home", None);
+        assert_eq!(plan.status, "no_compatible_path");
+        assert!(!plan.skipped_edges.is_empty());
     }
 }

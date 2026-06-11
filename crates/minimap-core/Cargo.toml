@@ -8,5 +8,6 @@ repository.workspace = true
 
 [dependencies]
 minimap-schemas = { version = "0.2.0", path = "../minimap-schemas" }
+deunicode.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

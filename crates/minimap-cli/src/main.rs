@@ -5,8 +5,8 @@ use minimap_android::{
     TapPoint,
 };
 use minimap_core::{
-    fingerprint_layout, fingerprint_usable, match_place, normalize_label, place_id_for_slug,
-    redact_layout,
+    detect_overlay, fingerprint_layout, fingerprint_usable, match_place, normalize_label,
+    place_id_for_slug, redact_layout,
 };
 use minimap_graph::{exit_code_for_status, resolve_path};
 use minimap_repo::{
@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime};
 
 const DEFAULT_ACTION_SETTLE_MS: u64 = 1_000;
 const SESSION_TTL_SECS: u64 = 600;
+const PENDING_TTL_SECS: u64 = 600;
 const LAYOUT_CACHE_TTL_SECS: u64 = 30;
 
 #[derive(Debug, Parser)]
@@ -64,6 +65,11 @@ enum Commands {
     Whereami {
         #[arg(long)]
         label: Option<String>,
+        /// If the label slug collides with a different known place, append the
+        /// smallest free numeric suffix (e.g. `account-settings-2`) instead of
+        /// returning label_mismatch.
+        #[arg(long = "allow-duplicate-label")]
+        allow_duplicate_label: bool,
     },
     /// Navigate to a known place through verified graph edges.
     Go { target: String },
@@ -81,6 +87,11 @@ enum Commands {
         label: Option<String>,
         #[arg(long)]
         reason: Option<String>,
+        /// If the destination label slug collides with a different known place,
+        /// append the smallest free numeric suffix (e.g. `account-settings-2`)
+        /// instead of returning label_mismatch.
+        #[arg(long = "allow-duplicate-label")]
+        allow_duplicate_label: bool,
     },
     /// Scroll and retain the action as part of a pending transition recipe.
     Scroll {
@@ -129,6 +140,7 @@ struct TapRequest<'a> {
     screenshot: Option<&'a str>,
     label: Option<&'a str>,
     reason: Option<&'a str>,
+    allow_duplicate_label: bool,
 }
 
 fn main() {
@@ -173,14 +185,24 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Commands::Doctor => {
             let result = doctor(&root);
-            let ok = result["ok"].as_bool().unwrap_or(false);
+            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
-            Ok(if ok { 0 } else { 1 })
+            Ok(code)
         }
-        Commands::Whereami { label } => {
+        Commands::Whereami {
+            label,
+            allow_duplicate_label,
+        } => {
             let mut android = AndroidCli::new(SubprocessRunner);
             let mut adb = Adb::new(SubprocessRunner);
-            let result = whereami_result(&root, &mut android, &mut adb, label.as_deref(), true)?;
+            let result = whereami_result(
+                &root,
+                &mut android,
+                &mut adb,
+                label.as_deref(),
+                allow_duplicate_label,
+                true,
+            )?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
             Ok(code)
@@ -200,6 +222,7 @@ fn run(cli: Cli) -> Result<i32> {
             screenshot,
             label,
             reason,
+            allow_duplicate_label,
         } => {
             let mut android = AndroidCli::new(SubprocessRunner);
             let mut adb = Adb::new(SubprocessRunner);
@@ -214,6 +237,7 @@ fn run(cli: Cli) -> Result<i32> {
                     screenshot: screenshot.as_deref(),
                     label: label.as_deref(),
                     reason: reason.as_deref(),
+                    allow_duplicate_label,
                 },
             )?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
@@ -280,6 +304,7 @@ fn whereami_result<AR: CommandRunner, DR: CommandRunner>(
     android: &mut AndroidCli<AR>,
     adb: &mut Adb<DR>,
     label: Option<&str>,
+    allow_duplicate_label: bool,
     allow_write: bool,
 ) -> Result<Value> {
     if label.is_none() {
@@ -298,7 +323,14 @@ fn whereami_result<AR: CommandRunner, DR: CommandRunner>(
     }
 
     let layout = observe_layout(android, false)?;
-    let orientation = orient_layout(root, &layout, label, allow_write, adb)?;
+    let orientation = orient_layout(
+        root,
+        &layout,
+        label,
+        allow_duplicate_label,
+        allow_write,
+        adb,
+    )?;
     remember_orientation_session(root, adb, &orientation, &layout)?;
     Ok(orientation_json(root, &orientation, false))
 }
@@ -307,6 +339,7 @@ fn orient_layout<DR: CommandRunner>(
     root: &Path,
     layout: &Value,
     label: Option<&str>,
+    allow_duplicate_label: bool,
     allow_write: bool,
     adb: &mut Adb<DR>,
 ) -> Result<Orientation> {
@@ -326,10 +359,9 @@ fn orient_layout<DR: CommandRunner>(
     };
 
     if let Some(label) = label {
+        // normalize_label always yields a non-empty pure-ASCII slug (Tranche C),
+        // so there is no empty-slug case to guard.
         let slug = normalize_label(label);
-        if slug.is_empty() {
-            anyhow::bail!("--label must normalize to a non-empty slug");
-        }
         let existing_label_place = graph
             .places
             .values()
@@ -337,14 +369,27 @@ fn orient_layout<DR: CommandRunner>(
             .cloned();
         match (matched_place.clone(), existing_label_place) {
             (Some(place), Some(existing)) if place.id != existing.id => {
-                return Ok(Orientation {
-                    status: "label_mismatch".to_string(),
-                    baseline,
-                    matched_place: Some(place),
-                    confidence: matched.confidence,
-                    hash_matched: matched.hash_matched,
-                    changed_files,
-                });
+                // The current screen matched a known place, but the requested
+                // label slug is already owned by a DIFFERENT place. By default
+                // this is a label_mismatch; under --allow-duplicate-label we
+                // relabel the matched place with the smallest free numeric
+                // suffix instead.
+                if allow_write && allow_duplicate_label {
+                    let unique = unique_label(&graph, label, &slug);
+                    let (new_place, mut files) = relabel_place(root, &place, &unique, &baseline)?;
+                    changed_files.append(&mut files);
+                    matched_place = Some(new_place);
+                    status = "ok".to_string();
+                } else {
+                    return Ok(Orientation {
+                        status: "label_mismatch".to_string(),
+                        baseline,
+                        matched_place: Some(place),
+                        confidence: matched.confidence,
+                        hash_matched: matched.hash_matched,
+                        changed_files,
+                    });
+                }
             }
             (Some(mut place), Some(_)) => {
                 if allow_write && remember_place_observation(&mut place, &baseline) {
@@ -365,31 +410,36 @@ fn orient_layout<DR: CommandRunner>(
                 }
             }
             (None, Some(_existing)) => {
-                return Ok(Orientation {
-                    status: "label_mismatch".to_string(),
-                    baseline,
-                    matched_place: None,
-                    confidence: matched.confidence,
-                    hash_matched: matched.hash_matched,
-                    changed_files,
-                });
+                // A NEW fingerprint whose slug collides with a different existing
+                // place: label_mismatch (no write) by default, or a fresh
+                // suffixed place under --allow-duplicate-label.
+                if allow_write && allow_duplicate_label && fingerprint_usable(&baseline) {
+                    let unique = unique_label(&graph, label, &slug);
+                    let place = place_from_label(&unique, &baseline);
+                    changed_files.push(commit_place(root, &place)?);
+                    commit_pending_edge_for_place(root, adb, &graph, &place, &baseline)?
+                        .into_iter()
+                        .for_each(|file| changed_files.push(file));
+                    matched_place = Some(place);
+                    status = "ok".to_string();
+                } else {
+                    return Ok(Orientation {
+                        status: "label_mismatch".to_string(),
+                        baseline,
+                        matched_place: None,
+                        confidence: matched.confidence,
+                        hash_matched: matched.hash_matched,
+                        changed_files,
+                    });
+                }
             }
             (None, None) => {
                 if allow_write && fingerprint_usable(&baseline) {
                     let place = place_from_label(label, &baseline);
                     changed_files.push(commit_place(root, &place)?);
-                    if let Some(mut pending) = load_pending(root, adb)? {
-                        if pending.destination.identity_hash == baseline.identity_hash {
-                            let edge = edge_from_parts(
-                                &pending.source,
-                                &endpoint_for_place(&place),
-                                pending.recipe.split_off(0),
-                                pending.intent.as_deref(),
-                            );
-                            changed_files.push(commit_edge(root, &edge)?);
-                            clear_pending(root, adb)?;
-                        }
-                    }
+                    commit_pending_edge_for_place(root, adb, &graph, &place, &baseline)?
+                        .into_iter()
+                        .for_each(|file| changed_files.push(file));
                     matched_place = Some(place);
                     status = "ok".to_string();
                 }
@@ -427,12 +477,7 @@ fn orientation_json(root: &Path, orientation: &Orientation, include_exits: bool)
     let known_exits = if include_exits {
         graph
             .as_ref()
-            .and_then(|graph| {
-                orientation
-                    .matched_place
-                    .as_ref()
-                    .map(|place| (graph, place))
-            })
+            .zip(orientation.matched_place.as_ref())
             .map(|(graph, place)| {
                 graph
                     .edges
@@ -580,7 +625,7 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
     let (minimap, cache_hit) = if diff {
         (json!({"orientation": "unavailable_for_diff"}), false)
     } else {
-        let orientation = orient_layout(root, &layout, None, false, adb)?;
+        let orientation = orient_layout(root, &layout, None, false, false, adb)?;
         remember_orientation_session(root, adb, &orientation, &layout)?;
         let graph = load_graph(root).unwrap_or_else(|_| Graph {
             places: Default::default(),
@@ -629,9 +674,18 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
     if request.screenshot_label.is_some() && request.screenshot.is_none() {
         anyhow::bail!("--screenshot-label requires --screenshot");
     }
+    // Validate the supplied value before observing/orienting the layout (which can
+    // write to the graph). A malformed coordinate/selector must be a guaranteed
+    // no-op, not a partial mutation that then errors out.
+    if let Some(point) = request.point {
+        parse_point(point)?;
+    }
+    if let Some(selector) = request.selector {
+        parse_selector(selector)?;
+    }
 
     let pre_layout = observe_layout(android, false)?;
-    let pre_orientation = orient_layout(root, &pre_layout, None, true, adb)?;
+    let pre_orientation = orient_layout(root, &pre_layout, None, false, true, adb)?;
     let pre_pending = load_pending(root, adb)?;
     let source_place = match pre_orientation.matched_place.clone() {
         Some(place) => place,
@@ -659,7 +713,7 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
             }
         }
     };
-    let action = build_and_execute_tap_action(
+    let action = match build_and_execute_tap_action(
         android,
         adb,
         &pre_layout,
@@ -667,7 +721,23 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
         request.point,
         request.screenshot_label,
         request.screenshot,
-    )?;
+    )? {
+        TapActionOutcome::Recorded(action) => action,
+        TapActionOutcome::SelectorNotFound(message) => {
+            return Ok(result_with_data(
+                "action_failed",
+                &message,
+                json!({"changed_graph": false, "changed_files": []}),
+            ));
+        }
+        TapActionOutcome::ViewportUnavailable => {
+            return Ok(result_with_data(
+                "environment_error",
+                "device viewport unavailable for geometry edge",
+                json!({"changed_graph": false, "changed_files": []}),
+            ));
+        }
+    };
     let pending = pre_pending.filter(|pending| {
         pending.source.id == source_place.id
             && pending.destination.identity_hash == pre_orientation.baseline.identity_hash
@@ -727,10 +797,8 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
 
     let destination = match request.label {
         Some(label) => {
+            // normalize_label always yields a non-empty pure-ASCII slug.
             let slug = normalize_label(label);
-            if slug.is_empty() {
-                anyhow::bail!("--label must normalize to a non-empty slug");
-            }
             let label_place = graph
                 .places
                 .values()
@@ -749,7 +817,10 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
                         }),
                     ));
                 }
-                (Some(mut target), _) => {
+                // The post-layout fingerprint matched the place that already owns
+                // this label slug: a legitimate same-place observation, so fold it
+                // in as a variant.
+                (Some(mut target), Some(_observed)) => {
                     if target.baseline.identity_hash != post_baseline.identity_hash
                         && !fingerprint_usable(&post_baseline)
                     {
@@ -763,6 +834,38 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
                         changed_files.push(commit_place(root, &target)?);
                     }
                     target
+                }
+                // A NEW fingerprint (no similarity match) whose label slug collides
+                // with a DIFFERENT existing place. Previously this silently merged
+                // the new screen into the slug owner; now it is a label_mismatch
+                // (no write) by default, or a fresh suffixed place under
+                // --allow-duplicate-label.
+                (Some(target), None) => {
+                    if !request.allow_duplicate_label {
+                        return Ok(result_with_data(
+                            "label_mismatch",
+                            "tap reached a new place whose label collides with a different known place; pass --allow-duplicate-label to keep both",
+                            json!({
+                                "requested_label": slug,
+                                "collides_with": target.slug,
+                                "changed_graph": false,
+                                "changed_files": []
+                            }),
+                        ));
+                    }
+                    if !fingerprint_usable(&post_baseline) {
+                        clear_session_place(root, adb)?;
+                        return Ok(result_with_data(
+                            "unknown",
+                            "destination layout has no usable fingerprint",
+                            json!({"changed_graph": false, "changed_files": []}),
+                        ));
+                    }
+                    let unique = unique_label(&graph, label, &slug);
+                    let place = place_from_label(&unique, &post_baseline);
+                    changed_files.push(commit_place(root, &place)?);
+                    graph.places.insert(place.id.clone(), place.clone());
+                    place
                 }
                 (None, Some(observed)) => {
                     return Ok(result_with_data(
@@ -796,6 +899,17 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
             if let Some(place) = matched_post {
                 place
             } else {
+                if let Some(reason) = detect_overlay(&post_layout) {
+                    return Ok(result_with_data(
+                        "blocked_by_overlay",
+                        "a blocking overlay (e.g. a permission dialog) intercepted the transition; no edge recorded",
+                        json!({
+                            "reason": reason,
+                            "changed_graph": false,
+                            "changed_files": []
+                        }),
+                    ));
+                }
                 save_pending(
                     root,
                     adb,
@@ -849,6 +963,16 @@ fn tap_result<AR: CommandRunner, DR: CommandRunner>(
     ))
 }
 
+/// Outcome of attempting a tap action. Runtime/device failures are surfaced as
+/// structured variants so `tap_result` can map them to the right status
+/// (`action_failed` / `environment_error`) instead of letting them bubble up to
+/// the `main()` catch-all and collapse into `config_error`.
+enum TapActionOutcome {
+    Recorded(ActionStep),
+    SelectorNotFound(String),
+    ViewportUnavailable,
+}
+
 fn build_and_execute_tap_action<AR: CommandRunner, DR: CommandRunner>(
     android: &mut AndroidCli<AR>,
     adb: &mut Adb<DR>,
@@ -857,33 +981,35 @@ fn build_and_execute_tap_action<AR: CommandRunner, DR: CommandRunner>(
     point: Option<&str>,
     screenshot_label: Option<i64>,
     screenshot: Option<&str>,
-) -> Result<ActionStep> {
+) -> Result<TapActionOutcome> {
     if let Some(selector) = selector {
-        let tap_point = resolve_selector_point(pre_layout, selector)?;
+        let tap_point = match resolve_selector_point(pre_layout, selector) {
+            Ok(point) => point,
+            Err(error) => return Ok(TapActionOutcome::SelectorNotFound(error.to_string())),
+        };
         adb.tap(tap_point)?;
         let (kind, value) = parse_selector(selector)?;
-        return Ok(ActionStep {
+        return Ok(TapActionOutcome::Recorded(ActionStep {
             kind: "tap".to_string(),
             selector: Some(Selector { kind, value }),
             point: None,
             viewport: None,
             direction: None,
-        });
+        }));
     }
     if let Some(point) = point {
         let (x, y) = parse_point(point)?;
         adb.tap(TapPoint { x, y })?;
-        let viewport = adb.display_size().ok();
-        if viewport.is_none() {
-            anyhow::bail!("viewport_required_for_geometry_edge");
-        }
-        return Ok(ActionStep {
+        let Some(viewport) = adb.display_size().ok() else {
+            return Ok(TapActionOutcome::ViewportUnavailable);
+        };
+        return Ok(TapActionOutcome::Recorded(ActionStep {
             kind: "tap".to_string(),
             selector: None,
             point: Some(Point { x, y }),
-            viewport,
+            viewport: Some(viewport),
             direction: None,
-        });
+        }));
     }
     let label = screenshot_label.expect("checked action count");
     let screenshot = screenshot.expect("checked screenshot");
@@ -891,20 +1017,19 @@ fn build_and_execute_tap_action<AR: CommandRunner, DR: CommandRunner>(
     let resolved = android.screen_resolve(screenshot, &format!("input tap #{label}"))?;
     let tap_point = parse_input_tap(&resolved.stdout)?;
     adb.tap(tap_point)?;
-    let viewport = adb.display_size().ok();
-    if viewport.is_none() {
-        anyhow::bail!("viewport_required_for_geometry_edge");
-    }
-    Ok(ActionStep {
+    let Some(viewport) = adb.display_size().ok() else {
+        return Ok(TapActionOutcome::ViewportUnavailable);
+    };
+    Ok(TapActionOutcome::Recorded(ActionStep {
         kind: "tap".to_string(),
         selector: None,
         point: Some(Point {
             x: tap_point.x,
             y: tap_point.y,
         }),
-        viewport,
+        viewport: Some(viewport),
         direction: None,
-    })
+    }))
 }
 
 fn scroll_result<AR: CommandRunner, DR: CommandRunner>(
@@ -914,7 +1039,7 @@ fn scroll_result<AR: CommandRunner, DR: CommandRunner>(
     direction: &str,
 ) -> Result<Value> {
     let pre_layout = observe_layout(android, false)?;
-    let pre_orientation = orient_layout(root, &pre_layout, None, true, adb)?;
+    let pre_orientation = orient_layout(root, &pre_layout, None, false, true, adb)?;
     let source = pre_orientation.matched_place.clone();
     let viewport = adb.display_size().ok().unwrap_or(Viewport {
         width: 1080,
@@ -923,7 +1048,7 @@ fn scroll_result<AR: CommandRunner, DR: CommandRunner>(
     let (sx, sy, ex, ey) = swipe_for_direction(direction, viewport);
     adb.swipe(sx, sy, ex, ey, 350)?;
     let post_layout = observe_after_action(android, Some(&pre_orientation.baseline))?;
-    let post_orientation = orient_layout(root, &post_layout, None, true, adb)?;
+    let post_orientation = orient_layout(root, &post_layout, None, false, true, adb)?;
     let step = ActionStep {
         kind: "scroll".to_string(),
         selector: None,
@@ -992,10 +1117,10 @@ fn back_result<AR: CommandRunner, DR: CommandRunner>(
     adb: &mut Adb<DR>,
 ) -> Result<Value> {
     let pre_layout = observe_layout(android, false)?;
-    let pre_orientation = orient_layout(root, &pre_layout, None, true, adb)?;
+    let pre_orientation = orient_layout(root, &pre_layout, None, false, true, adb)?;
     adb.back()?;
     let post_layout = observe_after_action(android, Some(&pre_orientation.baseline))?;
-    let post_orientation = orient_layout(root, &post_layout, None, true, adb)?;
+    let post_orientation = orient_layout(root, &post_layout, None, false, true, adb)?;
     if let (Some(source), Some(dest)) = (
         pre_orientation.matched_place.clone(),
         post_orientation.matched_place.clone(),
@@ -1073,7 +1198,7 @@ fn go_result<AR: CommandRunner, DR: CommandRunner>(
         } else {
             clear_session_place(root, adb)?;
             let layout = observe_layout(android, false)?;
-            let orientation = orient_layout(root, &layout, None, true, adb)?;
+            let orientation = orient_layout(root, &layout, None, false, true, adb)?;
             let Some(place) = orientation.matched_place.clone() else {
                 return Ok(result_with_data(
                     "unknown",
@@ -1089,7 +1214,7 @@ fn go_result<AR: CommandRunner, DR: CommandRunner>(
         }
     } else {
         let layout = observe_layout(android, false)?;
-        let orientation = orient_layout(root, &layout, None, true, adb)?;
+        let orientation = orient_layout(root, &layout, None, false, true, adb)?;
         let Some(place) = orientation.matched_place.clone() else {
             return Ok(result_with_data(
                 "unknown",
@@ -1103,13 +1228,9 @@ fn go_result<AR: CommandRunner, DR: CommandRunner>(
         };
         (layout, place, orientation.changed_files.clone())
     };
-    let mut viewport_used = false;
-    let mut plan = resolve_path(&graph, target, &current_place.id, None);
-    if plan.status == "no_compatible_path" {
-        let viewport = adb.display_size().ok();
-        viewport_used = viewport.is_some();
-        plan = resolve_path(&graph, target, &current_place.id, viewport);
-    }
+    let viewport = adb.display_size().ok();
+    let viewport_used = viewport.is_some();
+    let plan = resolve_path(&graph, target, &current_place.id, viewport);
     if plan.status != "ok" {
         return Ok(result_with_data(
             &plan.status,
@@ -1121,7 +1242,17 @@ fn go_result<AR: CommandRunner, DR: CommandRunner>(
     let mut changed_files = orientation_changes;
     let mut last_place = current_place.clone();
     for edge in &plan.edges {
-        execute_recipe(android, adb, &edge.recipe, Some(&current_layout))?;
+        if let Err(error) = execute_recipe(android, adb, &edge.recipe, Some(&current_layout)) {
+            return Ok(result_with_data(
+                "action_failed",
+                &error.to_string(),
+                json!({
+                    "edge": edge.id,
+                    "changed_graph": false,
+                    "changed_files": []
+                }),
+            ));
+        }
         let previous_baseline = fingerprint_layout(&current_layout);
         let post_layout = observe_after_action(android, Some(&previous_baseline))?;
         let post_baseline = fingerprint_layout(&post_layout);
@@ -1159,6 +1290,17 @@ fn go_result<AR: CommandRunner, DR: CommandRunner>(
                 ));
             }
             None => {
+                if let Some(reason) = detect_overlay(&post_layout) {
+                    return Ok(result_with_data(
+                        "blocked_by_overlay",
+                        "a blocking overlay (e.g. a permission dialog) intercepted the transition; no edge recorded",
+                        json!({
+                            "reason": reason,
+                            "changed_graph": false,
+                            "changed_files": []
+                        }),
+                    ));
+                }
                 return Ok(result_with_data(
                     "unknown",
                     "edge reached an unknown layout; graph unchanged",
@@ -1204,6 +1346,7 @@ fn execute_recipe<AR: CommandRunner, DR: CommandRunner>(
     initial_layout: Option<&Value>,
 ) -> Result<()> {
     let mut cached_layout = initial_layout.cloned();
+    let current_display_size = adb.display_size().ok();
     for step in recipe {
         match step.kind.as_str() {
             "tap" => {
@@ -1218,8 +1361,12 @@ fn execute_recipe<AR: CommandRunner, DR: CommandRunner>(
                     )?;
                     adb.tap(point)?;
                 } else if let Some(point) = step.point {
-                    if step.viewport.is_some() && adb.display_size().ok() != step.viewport {
-                        anyhow::bail!("geometry edge viewport does not match current device");
+                    if step.is_geometry()
+                        && (step.viewport.is_none() || current_display_size != step.viewport)
+                    {
+                        anyhow::bail!(
+                            "geometry edge requires a matching device viewport; refusing to tap raw pixels"
+                        );
                     }
                     adb.tap(TapPoint {
                         x: point.x,
@@ -1296,6 +1443,52 @@ fn place_from_label(label: &str, baseline: &PlaceBaseline) -> Place {
     }
 }
 
+/// Derive a label whose slug does not collide with any existing place by
+/// appending the smallest free numeric suffix (e.g. `Account Settings` ->
+/// `Account Settings 2`, normalizing to `account-settings-2`). `slug` is the
+/// already-normalized form of `label`; it is assumed to be taken.
+fn unique_label(graph: &Graph, label: &str, slug: &str) -> String {
+    let taken = |candidate: &str| graph.places.values().any(|place| place.slug == candidate);
+    debug_assert!(taken(slug), "unique_label called for a free slug");
+    let base = label.trim();
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !taken(&normalize_label(&candidate)) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// If a pending transition lands on `place` (its destination hash matches and its
+/// source is a known place), commit the edge and clear the pending state.
+/// Returns the committed edge file path (if any) so the caller can record it.
+fn commit_pending_edge_for_place<DR: CommandRunner>(
+    root: &Path,
+    adb: &mut Adb<DR>,
+    graph: &Graph,
+    place: &Place,
+    baseline: &PlaceBaseline,
+) -> Result<Option<PathBuf>> {
+    if let Some(mut pending) = load_pending(root, adb)? {
+        if pending.destination.identity_hash == baseline.identity_hash
+            && graph.places.contains_key(&pending.source.id)
+        {
+            let edge = edge_from_parts(
+                &pending.source,
+                &endpoint_for_place(place),
+                pending.recipe.split_off(0),
+                pending.intent.as_deref(),
+            );
+            let file = commit_edge(root, &edge)?;
+            clear_pending(root, adb)?;
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
+}
+
 fn remember_place_observation(place: &mut Place, baseline: &PlaceBaseline) -> bool {
     if place.baseline.identity_hash == baseline.identity_hash
         || place
@@ -1340,7 +1533,7 @@ fn relabel_place(
     new_place.slug = new_slug.clone();
     new_place.label = label.trim().to_string();
     new_place.id = place_id_for_slug(&new_slug);
-    new_place.baseline = baseline.clone();
+    remember_place_observation(&mut new_place, baseline);
     remove_place_file(root, &old_id)?;
     changed.push(commit_place(root, &new_place)?);
     for edge in graph.edges.values() {
@@ -1392,9 +1585,15 @@ fn edge_id(from: &EdgeEndpoint, to: &EdgeEndpoint, recipe: &[ActionStep]) -> Str
     if slug.len() <= 96 {
         slug
     } else {
-        let digest =
-            Sha256::digest(canonical_json(&serde_json::to_value(recipe).unwrap()).as_bytes());
-        format!("edge_{}__{}__{:x}", from.slug, to.slug, digest)[..96].to_string()
+        // The readable form is too long, so derive a stable, collision-resistant
+        // id from the recipe digest. Keep a char-boundary-truncated readable
+        // prefix for legibility, then append the full fixed-length hex digest.
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(canonical_json(&serde_json::to_value(recipe).unwrap()).as_bytes())
+        );
+        let prefix: String = slug.chars().take(32).collect();
+        sanitize_id(&format!("{prefix}__{digest}"))
     }
 }
 
@@ -1490,16 +1689,21 @@ fn changed_files_json(paths: &[PathBuf]) -> Value {
         .collect::<Vec<_>>())
 }
 
-fn pending_path<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<PathBuf> {
+/// Resolve the cache path for a given file name. Returns `Ok(None)` when the
+/// device serial cannot be resolved: without a serial we cannot safely scope the
+/// cache to one device, and a shared "unknown-device" bucket would let two
+/// devices read each other's cached place, so we skip the cache entirely.
+fn pending_path<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<Option<PathBuf>> {
     let repo = root
         .canonicalize()
         .unwrap_or_else(|_| root.to_path_buf())
         .display()
         .to_string();
     let repo_hash = format!("{:x}", Sha256::digest(repo.as_bytes()));
-    let serial = adb
-        .serial()
-        .unwrap_or_else(|_| "unknown-device".to_string());
+    let serial = match adb.serial() {
+        Ok(serial) if !serial.trim().is_empty() => serial,
+        _ => return Ok(None),
+    };
     let package = load_config(root)
         .ok()
         .and_then(|config| {
@@ -1510,18 +1714,22 @@ fn pending_path<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<Pat
         })
         .filter(|package| !package.is_empty())
         .unwrap_or_else(|| "default-package".to_string());
-    Ok(std::env::temp_dir()
-        .join("minimap")
-        .join(&repo_hash[..16])
-        .join(sanitize_id(&serial))
-        .join(sanitize_id(&package))
-        .join("pending-transition.json"))
+    Ok(Some(
+        std::env::temp_dir()
+            .join("minimap")
+            .join(&repo_hash[..16])
+            .join(sanitize_id(&serial))
+            .join(sanitize_id(&package))
+            .join("pending-transition.json"),
+    ))
 }
 
-fn session_path<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<PathBuf> {
-    let mut path = pending_path(root, adb)?;
+fn session_path<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<Option<PathBuf>> {
+    let Some(mut path) = pending_path(root, adb)? else {
+        return Ok(None);
+    };
     path.set_file_name("session-place.json");
-    Ok(path)
+    Ok(Some(path))
 }
 
 fn remember_orientation_session<DR: CommandRunner>(
@@ -1550,16 +1758,20 @@ fn save_session_place<DR: CommandRunner>(
     baseline: &PlaceBaseline,
     layout: &Value,
 ) -> Result<()> {
-    let path = session_path(root, adb)?;
+    let Some(path) = session_path(root, adb)? else {
+        return Ok(());
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        restrict_cache_dir_permissions(parent);
     }
     let value = json!({
         "place": place,
         "baseline": baseline,
         "layout": redact_layout(layout)
     });
-    fs::write(path, canonical_json(&value))?;
+    fs::write(&path, canonical_json(&value))?;
+    restrict_cache_file_permissions(&path);
     Ok(())
 }
 
@@ -1567,7 +1779,9 @@ fn load_session_place<DR: CommandRunner>(
     root: &Path,
     adb: &mut Adb<DR>,
 ) -> Result<Option<SessionPlace>> {
-    let path = session_path(root, adb)?;
+    let Some(path) = session_path(root, adb)? else {
+        return Ok(None);
+    };
     if !path.exists() {
         return Ok(None);
     }
@@ -1596,7 +1810,9 @@ fn load_recent_session_place<DR: CommandRunner>(
     adb: &mut Adb<DR>,
     max_age: Duration,
 ) -> Result<Option<SessionPlace>> {
-    let path = session_path(root, adb)?;
+    let Some(path) = session_path(root, adb)? else {
+        return Ok(None);
+    };
     if !path.exists() {
         return Ok(None);
     }
@@ -1632,7 +1848,9 @@ fn graph_place_for_session(graph: &Graph, session: &SessionPlace) -> Option<Plac
 }
 
 fn clear_session_place<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<()> {
-    let path = session_path(root, adb)?;
+    let Some(path) = session_path(root, adb)? else {
+        return Ok(());
+    };
     if path.exists() {
         fs::remove_file(path)?;
     }
@@ -1644,9 +1862,12 @@ fn save_pending<DR: CommandRunner>(
     adb: &mut Adb<DR>,
     pending: &PendingTransition,
 ) -> Result<()> {
-    let path = pending_path(root, adb)?;
+    let Some(path) = pending_path(root, adb)? else {
+        return Ok(());
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        restrict_cache_dir_permissions(parent);
     }
     let value = json!({
         "source": pending.source,
@@ -1654,7 +1875,8 @@ fn save_pending<DR: CommandRunner>(
         "destination": pending.destination,
         "intent": pending.intent
     });
-    fs::write(path, canonical_json(&value))?;
+    fs::write(&path, canonical_json(&value))?;
+    restrict_cache_file_permissions(&path);
     Ok(())
 }
 
@@ -1662,11 +1884,25 @@ fn load_pending<DR: CommandRunner>(
     root: &Path,
     adb: &mut Adb<DR>,
 ) -> Result<Option<PendingTransition>> {
-    let path = pending_path(root, adb)?;
+    let Some(path) = pending_path(root, adb)? else {
+        return Ok(None);
+    };
     if !path.exists() {
         return Ok(None);
     }
-    let value: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+    if let Ok(metadata) = fs::metadata(&path) {
+        if let Ok(modified) = metadata.modified() {
+            let expired = SystemTime::now()
+                .duration_since(modified)
+                .map(|age| age > Duration::from_secs(PENDING_TTL_SECS))
+                .unwrap_or(true);
+            if expired {
+                let _ = fs::remove_file(&path);
+                return Ok(None);
+            }
+        }
+    }
+    let value: Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
     Ok(Some(PendingTransition {
         source: serde_json::from_value(value["source"].clone())?,
         recipe: serde_json::from_value(value["recipe"].clone())?,
@@ -1676,13 +1912,287 @@ fn load_pending<DR: CommandRunner>(
 }
 
 fn clear_pending<DR: CommandRunner>(root: &Path, adb: &mut Adb<DR>) -> Result<()> {
-    let path = pending_path(root, adb)?;
+    let Some(path) = pending_path(root, adb)? else {
+        return Ok(());
+    };
     if path.exists() {
         fs::remove_file(path)?;
     }
     Ok(())
 }
 
+/// On Unix, restrict the minimap cache directory tree to the owner (0o700) so
+/// cache files on a shared /tmp are not world-readable. Best-effort: failures to
+/// adjust permissions are ignored. No-op on non-Unix platforms.
+#[cfg(unix)]
+fn restrict_cache_dir_permissions(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let temp_root = std::env::temp_dir().join("minimap");
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if !path.starts_with(&temp_root) {
+            break;
+        }
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        if path == temp_root.as_path() {
+            break;
+        }
+        current = path.parent();
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_cache_dir_permissions(_dir: &Path) {}
+
+/// On Unix, restrict a written cache file to the owner (0o600). Best-effort; a
+/// no-op on non-Unix platforms.
+#[cfg(unix)]
+fn restrict_cache_file_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_cache_file_permissions(_path: &Path) {}
+
 fn print_json(value: &Value) {
     print!("{}", canonical_json(value));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minimap_android::CommandResult;
+    use minimap_schemas::{Fingerprint, StaticText};
+    use std::collections::BTreeMap;
+
+    /// Minimal fake `CommandRunner`. When `serial` is `Some`, `get-serialno`
+    /// succeeds with that value; when `None`, every command fails so `serial()`
+    /// errors and the cache is skipped.
+    struct FakeRunner {
+        serial: Option<String>,
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&mut self, args: &[String]) -> Result<CommandResult> {
+            if args.iter().any(|arg| arg == "get-serialno") {
+                if let Some(serial) = &self.serial {
+                    return Ok(CommandResult {
+                        args: args.to_vec(),
+                        status: 0,
+                        stdout: format!("{serial}\n"),
+                        stderr: String::new(),
+                    });
+                }
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                status: 1,
+                stdout: String::new(),
+                stderr: "no device".to_string(),
+            })
+        }
+    }
+
+    fn fake_adb(serial: Option<&str>) -> Adb<FakeRunner> {
+        Adb::new(FakeRunner {
+            serial: serial.map(str::to_string),
+        })
+    }
+
+    fn endpoint(slug: &str) -> EdgeEndpoint {
+        EdgeEndpoint {
+            id: format!("place_{slug}"),
+            slug: slug.to_string(),
+        }
+    }
+
+    fn baseline(hash: &str) -> PlaceBaseline {
+        PlaceBaseline {
+            identity_hash: format!("sha256:{hash}"),
+            fingerprint: Fingerprint {
+                selectors: Vec::new(),
+                static_text: vec![StaticText {
+                    value: hash.to_string(),
+                }],
+                roles: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn tap_step(value: &str) -> ActionStep {
+        ActionStep {
+            kind: "tap".to_string(),
+            selector: Some(Selector {
+                kind: "text".to_string(),
+                value: value.to_string(),
+            }),
+            point: None,
+            viewport: None,
+            direction: None,
+        }
+    }
+
+    // FIX 1: edge_id must never panic regardless of selector/slug length and must
+    // yield a valid sanitized id.
+    #[test]
+    fn edge_id_handles_long_selectors_without_panicking() {
+        let long_value = "x".repeat(200);
+        let from = endpoint("home");
+        let to = endpoint("search");
+        let recipe = vec![tap_step(&long_value)];
+        let id = edge_id(&from, &to, &recipe);
+        assert!(
+            id.starts_with("edge_"),
+            "id should keep readable prefix: {id}"
+        );
+        assert!(
+            id.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'),
+            "id must be a sanitized slug: {id}"
+        );
+        // Deterministic for the same recipe.
+        assert_eq!(id, edge_id(&from, &to, &recipe));
+    }
+
+    #[test]
+    fn edge_id_long_unicode_selector_does_not_panic() {
+        // Multi-byte chars near the truncation boundary must not split mid-UTF8.
+        let unicode_value = "é".repeat(120);
+        let from = endpoint("éhome");
+        let to = endpoint("search");
+        let recipe = vec![tap_step(&unicode_value)];
+        let id = edge_id(&from, &to, &recipe);
+        assert!(!id.is_empty());
+    }
+
+    // FIX 4: with no resolvable serial, the cache path is None (no shared bucket),
+    // so loads return None and saves are skipped (no file written).
+    #[test]
+    fn no_serial_skips_cache_entirely() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut adb = fake_adb(None);
+
+        assert!(pending_path(root, &mut adb).unwrap().is_none());
+        assert!(session_path(root, &mut adb).unwrap().is_none());
+
+        let pending = PendingTransition {
+            source: endpoint("home"),
+            recipe: vec![tap_step("SEARCH")],
+            destination: baseline("dest"),
+            intent: None,
+        };
+        save_pending(root, &mut adb, &pending).unwrap();
+        assert!(load_pending(root, &mut adb).unwrap().is_none());
+
+        // Nothing should have been written to the shared minimap temp tree on
+        // behalf of this serial-less invocation.
+        let path = pending_path(root, &mut adb).unwrap();
+        assert!(path.is_none());
+    }
+
+    // FIX 2: a pending file older than the TTL is ignored and removed.
+    #[test]
+    fn stale_pending_is_ignored_and_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut adb = fake_adb(Some("fix2-serial"));
+
+        let pending = PendingTransition {
+            source: endpoint("home"),
+            recipe: vec![tap_step("SEARCH")],
+            destination: baseline("dest"),
+            intent: None,
+        };
+        save_pending(root, &mut adb, &pending).unwrap();
+        let path = pending_path(root, &mut adb).unwrap().unwrap();
+        assert!(path.exists());
+
+        // Backdate the file well beyond the TTL.
+        let old = SystemTime::now() - Duration::from_secs(PENDING_TTL_SECS + 60);
+        filetime_set(&path, old);
+
+        assert!(load_pending(root, &mut adb).unwrap().is_none());
+        assert!(!path.exists(), "stale pending should be removed");
+    }
+
+    // FIX 3: a pending whose source.id is absent from the graph must NOT be
+    // committed as a dangling edge when orienting a new destination place.
+    #[test]
+    fn orient_does_not_commit_edge_from_missing_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run_init(
+            root,
+            InitOptions {
+                dry_run: false,
+                agents: "codex",
+                force: false,
+                refresh_skills: false,
+                no_skills: true,
+            },
+        )
+        .unwrap();
+        let mut adb = fake_adb(Some("fix3-serial"));
+
+        // A pending transition whose source place is NOT in the graph.
+        let dest_layout = json!({
+            "class": "Column",
+            "children": [
+                {"class": "Text", "text": "Brand New Destination Screen Title"},
+                {"class": "Text", "text": "A second distinctive line of body copy here"}
+            ]
+        });
+        let dest_baseline = fingerprint_layout(&dest_layout);
+        let pending = PendingTransition {
+            source: endpoint("ghost-source"),
+            recipe: vec![tap_step("SEARCH")],
+            destination: dest_baseline.clone(),
+            intent: Some("open ghost".to_string()),
+        };
+        save_pending(root, &mut adb, &pending).unwrap();
+
+        // Orient on the destination layout with a label -> a new place is created,
+        // but the edge must NOT be committed because the source is missing.
+        let orientation =
+            orient_layout(root, &dest_layout, Some("newdest"), false, true, &mut adb).unwrap();
+        assert_eq!(orientation.status, "ok");
+
+        let graph = load_graph(root).unwrap();
+        assert!(
+            graph.edges.is_empty(),
+            "no edge should be committed from a missing source: {:?}",
+            graph.edges
+        );
+    }
+
+    // FIX 7 (Unix only): written cache files are mode 0o600.
+    #[cfg(unix)]
+    #[test]
+    fn cache_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut adb = fake_adb(Some("fix7-serial"));
+
+        let pending = PendingTransition {
+            source: endpoint("home"),
+            recipe: vec![tap_step("SEARCH")],
+            destination: baseline("dest"),
+            intent: None,
+        };
+        save_pending(root, &mut adb, &pending).unwrap();
+        let path = pending_path(root, &mut adb).unwrap().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "cache file should be owner-only");
+    }
+
+    /// Set a file's mtime to `when` without an extra crate dependency.
+    /// `set_accessed`/`set_modified` live on `FileTimes` itself (cross-platform).
+    fn filetime_set(path: &Path, when: SystemTime) {
+        let times = fs::FileTimes::new().set_accessed(when).set_modified(when);
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(times).unwrap();
+    }
 }

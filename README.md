@@ -97,6 +97,33 @@ All commands return JSON by default. Graph changes are reported with
 There are no proposals, journals, run directories, or hidden repo-local runtime
 state. Review graph changes through normal git diffs and PRs.
 
+## Claude Code Plugin
+
+Claude Code users can install the Minimap skill from this repo's plugin
+marketplace.
+
+From Claude Code, add the marketplace:
+
+```text
+/plugin marketplace add himattm/minimap
+```
+
+Then install the plugin:
+
+```text
+/plugin install minimap@minimap
+```
+
+For local development from a checkout:
+
+```text
+/plugin marketplace add .
+/plugin install minimap@minimap
+```
+
+The plugin ships `minimap-app-navigation`, the same skill `minimap init`
+installs for everyday Minimap navigation and incremental graph growth.
+
 ## Live Device Smoke
 
 With an Android app already built, installed, and launched plus `android` and
@@ -110,6 +137,14 @@ minimap back
 minimap go search
 ```
 
-For broader manual validation, use the Compose sample apps in
-`/Users/mmckenna/Dev/compose-samples`; see
+For broader manual validation, clone the public
+[Android Compose samples](https://github.com/android/compose-samples) and build
+one of its apps (Jetsnack, JetNews, or Jetchat):
+
+```bash
+git clone https://github.com/android/compose-samples
+```
+
+Then build and launch a sample (for example Jetsnack) from the cloned
+`compose-samples/` checkout and run the smoke commands above against it; see
 [docs/MINIMAP_V1_LEAN_DESIGN.md](docs/MINIMAP_V1_LEAN_DESIGN.md).

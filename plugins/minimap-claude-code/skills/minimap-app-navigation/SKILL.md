@@ -11,6 +11,10 @@ metadata:
 Minimap is this repo's Android navigation memory for agents. It stores only
 verified places and transitions under `.minimap/graph`.
 
+Prerequisites: this skill needs the `minimap`, `android`, and `adb` binaries on
+`PATH`. Claude Code plugins cannot install binaries, so if `minimap --version`
+fails, ask the user to install minimap before continuing.
+
 Use this command loop:
 
 ```bash
@@ -27,6 +31,7 @@ Rules:
 - Unlabeled `whereami` may reuse very fresh verified session state for cheap orientation.
 - `tap --label <destination>` labels the post-tap destination.
 - Unknown destinations without `--label` are not committed.
+- If a `--label` slug collides with a different existing place, `whereami`/`tap` return `label_mismatch` and write nothing. Sibling screens that should share one item-agnostic place will match by fingerprint and merge automatically; only pass `--allow-duplicate-label` to deliberately keep two places with the same label, which appends the smallest free numeric suffix (e.g. `account-settings-2`).
 - `layout` is the raw Android layout escape hatch for business verification or finding selectors. Immediately after a verified Minimap observation, it may reuse the fresh session layout instead of calling Android layout again.
 - Do not use removed workflows: observe, learn, map, route, screen, accept, repair, validate, undo.
 - Review graph changes through normal git diff/PR review.
