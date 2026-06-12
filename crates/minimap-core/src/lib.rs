@@ -104,6 +104,19 @@ fn redact_value(value: &Value, key: Option<&str>) -> Value {
                 .map(|value| redact_value(value, None))
                 .collect(),
         ),
+        // Real `android layout` output encodes geometry as STRINGS (e.g.
+        // "center":"[1006,147]", "bounds":"[0,66][1080,2337]"). Those routinely
+        // carry >= 7 digits, so the numeric screen below would destroy them and
+        // break selector replay from cached layouts. Pass them through verbatim
+        // ONLY when the value matches the strict per-key geometry grammar;
+        // anything else under these keys keeps the default-deny screening.
+        Value::String(text)
+            if key
+                .map(|key| is_geometry_string(key, text))
+                .unwrap_or(false) =>
+        {
+            value.clone()
+        }
         Value::String(text) if sensitive_text_reason(text).is_some() => {
             json!({"redacted": true, "reason": sensitive_text_reason(text).unwrap()})
         }
@@ -130,6 +143,49 @@ fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_KEYS
         .iter()
         .any(|pattern| lowered.contains(pattern))
+}
+
+/// True when `text` is EXACTLY the string geometry real `android layout` emits
+/// for `key`: `[<digits>,<digits>]` under `center`, or
+/// `[<digits>,<digits>][<digits>,<digits>]` under `bounds`/`raw_bounds`.
+/// Whitespace between tokens is tolerated; signs, decimals, and any other
+/// characters are not, so non-geometry content under these keys still falls
+/// through to the default-deny screening.
+fn is_geometry_string(key: &str, text: &str) -> bool {
+    let pairs = match key {
+        "center" => 1,
+        "bounds" | "raw_bounds" => 2,
+        _ => return false,
+    };
+    let mut rest = text;
+    for _ in 0..pairs {
+        match consume_bracketed_pair(rest) {
+            Some(remaining) => rest = remaining,
+            None => return false,
+        }
+    }
+    rest.trim_start().is_empty()
+}
+
+/// Consume one `[<digits>,<digits>]` group (leading whitespace tolerated) and
+/// return the remainder.
+fn consume_bracketed_pair(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('[')?;
+    let rest = consume_digits(rest)?;
+    let rest = rest.trim_start().strip_prefix(',')?;
+    let rest = consume_digits(rest)?;
+    rest.trim_start().strip_prefix(']')
+}
+
+/// Consume one non-empty ASCII digit run (leading whitespace tolerated).
+fn consume_digits(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    if rest.len() == trimmed.len() {
+        None
+    } else {
+        Some(rest)
+    }
 }
 
 fn sensitive_text_reason(text: &str) -> Option<&'static str> {
@@ -1418,6 +1474,101 @@ mod tests {
         assert_eq!(
             redacted["note"],
             json!({"redacted": true, "reason": "numeric_sensitive"})
+        );
+    }
+
+    #[test]
+    fn redaction_preserves_string_geometry_under_geometry_keys() {
+        // Real `android layout` output encodes geometry as strings; these must
+        // survive redaction byte-for-byte or selector replay from a cached
+        // layout loses all tap geometry.
+        let layout = json!({
+            "class": "Button",
+            "text": "Checkout",
+            "center": "[1006,147]",
+            "bounds": "[0,66][1080,2337]",
+            "raw_bounds": "[ 0 , 66 ] [ 1080 , 2337 ]"
+        });
+        let redacted = redact_layout(&layout);
+        assert_eq!(redacted["center"], json!("[1006,147]"));
+        assert_eq!(redacted["bounds"], json!("[0,66][1080,2337]"));
+        assert_eq!(redacted["raw_bounds"], json!("[ 0 , 66 ] [ 1080 , 2337 ]"));
+    }
+
+    #[test]
+    fn redaction_still_screens_non_geometry_strings_under_geometry_keys() {
+        let layout = json!({
+            "class": "Text",
+            // Grouped PII shape (phone-like) under a geometry key.
+            "center": "555 1234",
+            // >= 7 digits but not the strict grammar (prose tail).
+            "bounds": "[555],[1234] call me",
+            // Wrong arity for the key (a single center-shaped pair under bounds).
+            "raw_bounds": "[1006,147]"
+        });
+        let redacted = redact_layout(&layout);
+        for key in ["center", "bounds", "raw_bounds"] {
+            assert_eq!(
+                redacted[key],
+                json!({"redacted": true, "reason": "numeric_sensitive"}),
+                "non-geometry string under {key} must stay screened"
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_grammar_is_strict() {
+        assert!(is_geometry_string("center", "[1006,147]"));
+        assert!(is_geometry_string("center", " [ 1006 , 147 ] "));
+        assert!(is_geometry_string("bounds", "[0,66][1080,2337]"));
+        assert!(is_geometry_string("raw_bounds", "[0,66] [1080,2337]"));
+        // Wrong arity for the key.
+        assert!(!is_geometry_string("center", "[0,66][1080,2337]"));
+        assert!(!is_geometry_string("bounds", "[1006,147]"));
+        // No signs, decimals, prose, or trailing garbage.
+        assert!(!is_geometry_string("center", "[-1006,147]"));
+        assert!(!is_geometry_string("center", "[1006.5,147]"));
+        assert!(!is_geometry_string("center", "[1006,147] call me"));
+        assert!(!is_geometry_string("center", "555 1234"));
+        // Only geometry keys participate in the bypass.
+        assert!(!is_geometry_string("text", "[1006,147]"));
+    }
+
+    #[test]
+    fn geometry_shaped_text_under_other_keys_keeps_default_screening() {
+        // "[1006,147]" carries 7 digits, so under a non-geometry key the
+        // existing numeric screen still fires (current-rule outcome).
+        let layout = json!({"class": "Text", "text": "[1006,147]"});
+        assert_eq!(
+            redact_layout(&layout)["text"],
+            json!({"redacted": true, "reason": "numeric_sensitive"})
+        );
+        // A short geometry-shaped string under a free-text key carries no
+        // sensitive signal, so the default-deny arm keeps it (current rule).
+        let layout = json!({"class": "Text", "note": "[12,34]"});
+        assert_eq!(redact_layout(&layout)["note"], json!("[12,34]"));
+    }
+
+    #[test]
+    fn string_geometry_passthrough_is_fingerprint_neutral() {
+        // bounds/raw_bounds/center are VOLATILE_KEYS stripped before hashing,
+        // so preserving them through redaction must not perturb identity hashes.
+        let with_geometry = json!({
+            "class": "Column",
+            "children": [{
+                "class": "Button",
+                "text": "Checkout",
+                "center": "[1006,147]",
+                "bounds": "[0,66][1080,2337]"
+            }]
+        });
+        let without_geometry = json!({
+            "class": "Column",
+            "children": [{"class": "Button", "text": "Checkout"}]
+        });
+        assert_eq!(
+            fingerprint_layout(&with_geometry).identity_hash,
+            fingerprint_layout(&without_geometry).identity_hash
         );
     }
 

@@ -410,6 +410,145 @@ fn go_replays_known_selector_edge() {
     assert_eq!(payload["data"]["executed_steps"][0]["to"], "search");
 }
 
+// REDACTION/GEOMETRY REGRESSION: real `android layout` output encodes geometry
+// as STRINGS ("center":"[540,2200]", "bounds":"[480,2100][600,2300]") whose
+// digit count trips the numeric-sensitive redaction screen. `go` seeds selector
+// resolution from the REDACTED session-cache layout, so if redaction destroys
+// the geometry strings, replay fails live with "matched node has no tap bounds"
+// (action_failed) even though the object-geometry fakes above stay green.
+#[test]
+fn go_replays_selector_edge_from_string_geometry_session_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(
+        &bin,
+        &[
+            "home_geo",
+            "home_geo",
+            "search_geo",
+            "home_geo",
+            "search_geo",
+        ],
+    );
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+    // Re-orient onto home so the session cache holds the (redacted) home layout
+    // with its string geometry; `go` must resolve the tap point from it.
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "search"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["target"], "search");
+    assert_eq!(payload["data"]["start_source"], "session");
+    assert_eq!(payload["data"]["executed_steps"][0]["to"], "search");
+}
+
+// KNOWN-EXITS REGRESSION: whereami hard-coded include_exits=false on both the
+// fresh and the session-cache paths, so `known_exits` was always [] even when
+// the oriented place had outgoing edges.
+#[test]
+fn whereami_reports_known_exits_on_fresh_and_cached_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search", "home"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    // Establish one outgoing edge home -> search.
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+
+    // Fresh path: a label bypasses the session cache, so this re-observes the
+    // home layout and must report the recorded exit.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["place"]["slug"], "home");
+    assert_eq!(payload.get("cache"), None);
+    let exits = payload["known_exits"].as_array().unwrap();
+    assert_eq!(exits.len(), 1, "fresh whereami must list the known exit");
+    assert_eq!(exits[0]["to"], "search");
+    assert_eq!(exits[0]["intent"], "open search");
+    assert!(exits[0]["edge"].as_str().is_some());
+
+    // Cache-hit path: the label-less rerun reuses the fresh session place and
+    // must carry the same exits.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["cache"]["hit"], true);
+    let exits = payload["known_exits"].as_array().unwrap();
+    assert_eq!(exits.len(), 1, "cached whereami must list the known exit");
+    assert_eq!(exits[0]["to"], "search");
+}
+
 #[test]
 fn whereami_reuses_fresh_verified_session_place() {
     let temp = tempfile::tempdir().unwrap();
@@ -1482,6 +1621,12 @@ if [ "$1" = "layout" ]; then
       ;;
     search)
       printf '{{"class":"Column","children":[{{"class":"Button","text":"HOME","bounds":{{"left":10,"top":20,"right":100,"bottom":120}}}},{{"class":"Text","text":"Categories"}},{{"class":"Text","text":"Lifestyles"}}]}}'
+      ;;
+    home_geo)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Button","text":"SEARCH","center":"[540,2200]","bounds":"[480,2100][600,2300]"}}]}}'
+      ;;
+    search_geo)
+      printf '{{"class":"Column","children":[{{"class":"Button","text":"HOME","center":"[100,8000]","bounds":"[0,7900][200,8100]"}},{{"class":"Text","text":"Categories"}},{{"class":"Text","text":"Lifestyles"}}]}}'
       ;;
     home_changed)
       printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Text","text":"SEARCH"}},{{"class":"Text","text":"Featured today"}}]}}'

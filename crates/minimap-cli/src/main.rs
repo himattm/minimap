@@ -32,6 +32,7 @@ const LAYOUT_CACHE_TTL_SECS: u64 = 30;
 
 #[derive(Debug, Parser)]
 #[command(name = "minimap")]
+#[command(version)]
 #[command(about = "Android navigation memory for AI agents.")]
 struct Cli {
     #[arg(long)]
@@ -336,7 +337,7 @@ fn whereami_result<AR: CommandRunner, DR: CommandRunner>(
         adb,
     )?;
     remember_orientation_session(root, adb, &orientation, &layout)?;
-    Ok(orientation_json(root, &orientation, false))
+    Ok(orientation_json(root, &orientation, true))
 }
 
 fn orient_layout<DR: CommandRunner>(
@@ -536,7 +537,7 @@ fn cached_whereami_json(root: &Path, baseline: &PlaceBaseline, place: &Place) ->
         hash_matched: true,
         changed_files: Vec::new(),
     };
-    let mut value = orientation_json(root, &orientation, false);
+    let mut value = orientation_json(root, &orientation, true);
     value["cache"] = json!({
         "hit": true,
         "source": "session-place",
