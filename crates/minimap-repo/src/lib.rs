@@ -1,164 +1,48 @@
 use anyhow::{Context, Result};
 use minimap_schemas::{
-    canonical_json, GraphContext, JournalEntry, NavigationEdge, Proposal, Route, ScreenNode,
-    CONFIG_SCHEMA_VERSION, EDGE_SCHEMA_VERSION, PROPOSAL_SCHEMA_VERSION, ROUTE_SCHEMA_VERSION,
-    SCREEN_SCHEMA_VERSION,
+    canonical_json, AppProfile, Edge, MinimapConfig, Place, CONFIG_SCHEMA_VERSION,
+    EDGE_SCHEMA_VERSION, PLACE_SCHEMA_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_SKILL_NAME: &str = APP_NAVIGATION_SKILL_NAME;
 pub const APP_NAVIGATION_SKILL_NAME: &str = "minimap-app-navigation";
-pub const FIRST_RUN_MAPPING_SKILL_NAME: &str = "minimap-first-run-mapping";
-pub const GITIGNORE_ENTRIES: &[&str] = &[".minimap/journal.jsonl"];
-
 pub const MINIMAP_DIRS: &[&str] = &[
     ".minimap",
     ".minimap/graph",
-    ".minimap/graph/screens",
+    ".minimap/graph/places",
     ".minimap/graph/edges",
-    ".minimap/routes",
-    ".minimap/proposals",
 ];
-
 pub const LEGACY_MINIMAP_PATHS: &[&str] = &[
+    ".minimap/graph/screens",
+    ".minimap/proposals",
+    ".minimap/routes",
     ".minimap/runs",
     ".minimap/state",
     ".minimap/checks",
+    ".minimap/journal.jsonl",
     ".minimap/current.json",
 ];
 
-pub const LEGACY_MINIMAP_MESSAGE: &str = "this project was initialized under minimap 0.1.x \u{2014} the on-disk layout has changed.\nplease remove `.minimap/` and re-run `minimap init`.\n\n(use `minimap init --force` to overwrite anyway.)\n(graph and routes from the old format are not migrated. see CHANGELOG.md for details.)";
+pub const LEGACY_MINIMAP_MESSAGE: &str = "this project has an incompatible pre-lean-v1 `.minimap/` layout. Run `minimap init --force` to replace `.minimap/` with the lean v1 config and graph directories.";
 
-pub fn detect_legacy_minimap(root: &Path) -> Vec<String> {
-    LEGACY_MINIMAP_PATHS
-        .iter()
-        .filter(|path| root.join(path).exists())
-        .map(|path| path.to_string())
-        .collect()
-}
+pub const INCOMPLETE_MINIMAP_MESSAGE: &str = "this project has a partial lean v1 `.minimap/` layout. Run `minimap init` again to non-destructively create the missing config and graph directories.";
 
-pub const APP_NAVIGATION_SKILL_BODY: &str = r#"---
-name: minimap-app-navigation
-description: Use in an Android codebase for any Minimap work — navigating the launched app, inspecting Android layout JSON, running android layout or android layout --diff, tapping UI elements, validating screens, learning routes, reusing known navigation, or growing the repo's Minimap graph one screen at a time even when no graph exists yet. Before calling android layout or raw adb tap commands directly, check Minimap first.
-metadata:
-  author: minimap
-  version: "1.0"
----
-
-# Minimap App Navigation Skill
-
-Minimap is this repo's shared navigation memory and soft validation layer for AI agents working in this Android codebase.
-
-Use Minimap before raw Android layout or adb tap commands. Stage learned graph updates, but do not accept or commit them without explicit user approval.
-
-## Incremental mapping
-
-Minimap graphs grow one screen at a time. An empty `.minimap/` after `minimap init` is normal — the graph fills in as the user navigates the app. Do not treat "no graph yet" as a reason to fall back to raw `android` or `adb` commands.
-
-When the user asks you to navigate to a route Minimap does not yet know, treat that navigation itself as a chance to record the route. Run the lightweight loop below, stage a proposal, and surface the proposal id. Do not auto-`accept` — wait for user approval.
-
-Lightweight loop for adding one screen:
-
-```bash
-minimap observe start <short-route-name>
-minimap layout
-minimap tap --selector "<kind>=<value>" --reason "<why>"
-minimap layout
-minimap observe stop
-minimap learn --from-current-run --stage
-```
-
-Then report the proposal id and stop.
-
-Selector preference (most stable first): test tag, resource id, accessibility/content description, stable visible text. Avoid coordinate taps unless nothing else is usable.
-
-When the graph already has the route, reuse it: `minimap route`, `minimap go`, `minimap check`. Run `minimap drift` or `minimap validate --all` when verifying existing screens.
-
-Always stage. Never `minimap accept` without explicit user approval.
-
-## Prerequisites
-
-The `minimap` CLI must be on `PATH`. Claude Code plugins cannot install binaries, so if `minimap --version` fails, ask the user to install it before continuing:
-
-- Homebrew: `brew install himattm/minimap/minimap`
-- Cargo: `cargo install minimap-cli`
-- From source: `cargo install --git https://github.com/himattm/minimap minimap-cli`
-
-`android` and `adb` must also be on `PATH` for any layout or tap commands.
-"#;
-
-pub const FIRST_RUN_MAPPING_SKILL_BODY: &str = r#"---
-name: minimap-first-run-mapping
-description: Use only when the user explicitly asks for a bounded bulk survey of the launched Android app — phrases like "map the whole app", "do first-run mapping", "bulk-map the app", "do an initial pass over <list of flows>", or "explore the app comprehensively." Do NOT fire on "use minimap", "this is a fresh repo", "navigate to X", "build the graph", or "record this route" — those are everyday incremental work and belong to minimap-app-navigation. For incremental mapping (one screen at a time as the user navigates), use minimap-app-navigation instead.
-metadata:
-  author: minimap
-  version: "1.0"
----
-
-# Minimap First-Run Mapping Skill
-
-If you found this skill via a vague trigger like "use minimap on this app", "this repo has no .minimap yet", or "navigate to X", stop and use `minimap-app-navigation` instead — it handles incremental mapping and is the right tool for everyday Minimap work. This skill is only for bounded bulk surveys the user explicitly asked for.
-
-Minimap first-run mapping does a deliberate bulk pass over a launched Android app to seed navigation memory across many flows at once. It is intentionally separate from everyday Minimap navigation because it is expensive: the agent must inspect Android layout JSON, decide what to tap, navigate the app, and record routes in a single sustained session.
-
-Stage learned graph updates, but do not accept or commit them without explicit user approval.
-
-## First-Run Mapping Mode
-
-Use this mode only when the user has explicitly asked for a bulk survey: "map the whole app", "do first-run mapping", "bulk-map the app", "do an initial pass over <flows>", "explore the app comprehensively." Anything narrower — a single route, a fresh repo, "build the graph over time" — belongs to `minimap-app-navigation`.
-
-Warn the user before starting: first-run mapping is token-intensive. Keep the run bounded by the user's requested scope. If no scope is given, map a small set of high-value flows first, then report what remains.
-
-Bounded reasons to invoke this skill:
-- The user explicitly requests a bulk initial app map.
-- A new feature area needs broad coverage in one pass.
-- A major UI redesign invalidated existing routes and a re-survey is requested.
-- A separate app context (logged-out, logged-in, onboarding, permission-gated, feature-flagged) needs mapping.
-- The user explicitly asks for additional route coverage across multiple flows.
-
-Prerequisites:
-- The Android app is already built, installed, launched, and on the screen where mapping should begin.
-- `minimap`, `android`, and `adb` are on PATH. Claude Code plugins cannot install binaries, so if `minimap --version` fails, ask the user to install it first:
-  - Homebrew: `brew install himattm/minimap/minimap`
-  - Cargo: `cargo install minimap-cli`
-  - From source: `cargo install --git https://github.com/himattm/minimap minimap-cli`
-- Run `minimap init --agents all` if Minimap has not been initialized.
-- Run `minimap doctor` and fix blocking environment issues before mapping.
-
-Mapping workflow for each route:
-1. Choose a short route name such as `settings`, `article-detail`, or `profile-edit`.
-2. Run `minimap map --discover <route-name> --max-actions 5 --stage`.
-3. Run `minimap layout` and inspect the current screen.
-4. Choose stable selectors in this order: test tag, resource id, accessibility/content description, stable visible text. Avoid coordinate taps unless there is no usable selector.
-5. Run `minimap tap --selector "<kind>=<value>" --reason "<why this moves toward the route>"`.
-6. Run `minimap layout` after each meaningful transition.
-7. Repeat only until the named route target is reached. Avoid unbounded crawling.
-8. Run `minimap map --discover <route-name> --max-actions 5 --stage --finish`.
-9. Record the proposal id/path for the user. Do not run `minimap accept` unless the user explicitly approves accepting staged graph changes.
-
-After mapping:
-- Run `minimap validate --all` when at least one route has been accepted.
-- Summarize mapped routes, staged proposals, selectors used, screens reached, and any flows skipped.
-- Keep raw layout observations in `.minimap/runs/`; do not commit raw layouts or runtime state.
-
-Failure handling:
-- If a selector no longer works, run `minimap drift` or `minimap repair <target> --stage`.
-- If the current screen is unknown, stage the proposal and report that review is required.
-- If login, onboarding, permissions, or feature flags block navigation, report the required context instead of forcing through it.
-"#;
+// Canonical skill text. `init` and the Claude Code plugin must install the same
+// source, so embed the plugin's SKILL.md directly (see
+// docs/MINIMAP_V1_LEAN_DESIGN.md skill-source invariant). The skill-equality
+// test below guards against drift.
+pub const APP_NAVIGATION_SKILL_BODY: &str =
+    include_str!("../../../plugins/minimap-claude-code/skills/minimap-app-navigation/SKILL.md");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InitChange {
     pub kind: String,
     pub path: String,
     pub status: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,78 +55,76 @@ pub struct InitResult {
     pub changes: Vec<InitChange>,
 }
 
-pub fn default_config() -> Value {
-    json!({
-        "schema_version": CONFIG_SCHEMA_VERSION,
-        "android": {
-            "app_package": "",
-            "assume_app_launched": true,
-            "permissions": []
-        },
-        "context": {
-            "auth_state": "unknown",
-            "onboarding_state": "unknown",
-            "locale": "unknown",
-            "orientation": "unknown",
-            "feature_flags": {}
-        },
-        "storage": {
-            "commit_raw_layouts": false,
-            "commit_runtime_telemetry": false,
-            "generate_index_cache": true,
-            "commit_index_cache": false
-        },
-        "navigation": {
-            "default_mode": "verified",
-            "safe_mode_fallback": true,
-            "screen_match_confidence_min": 0.78,
-            "repair_candidate_confidence_min": 0.65,
-            "transition_timeout_ms": 3000,
-            "post_tap_settle_ms": 500
-        },
-        "normalization": {
-            "store_normalized_bounds": true,
-            "collapse_repeating_lists": true,
-            "strip_dynamic_text_inputs": true
-        },
-        "redaction": {
-            "run_before_hashing": true,
-            "default_text_action": "exclude",
-            "commit_verbatim_text": false,
-            "allowlist_static_text": ["Home", "Settings", "Bookmarks"]
-        },
-        "skills": {
-            "skill_name": DEFAULT_SKILL_NAME,
-            "skill_names": [APP_NAVIGATION_SKILL_NAME, FIRST_RUN_MAPPING_SKILL_NAME],
-            "install_strategy": "multi-write-detected",
-            "install_paths": [".agents/skills", ".codex/skills", ".skills", ".agent/skills", ".claude/skills", ".gemini/skills"]
-        }
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InitOptions<'a> {
+    pub dry_run: bool,
+    pub agents: &'a str,
+    pub force: bool,
+    pub refresh_skills: bool,
+    pub no_skills: bool,
 }
 
-pub fn run_init(root: &Path, dry_run: bool, agents: &str) -> Result<InitResult> {
-    let agents = parse_agents(agents)?;
-    let skill_paths = skill_paths_for_agents(&agents);
-    let changes = plan_init(root, &skill_paths);
-    if !dry_run {
-        apply_init(root, &changes)?;
+pub fn default_config() -> MinimapConfig {
+    MinimapConfig {
+        schema_version: CONFIG_SCHEMA_VERSION.to_string(),
+        active_app_profile: "default".to_string(),
+        app_profiles: BTreeMap::from([(
+            "default".to_string(),
+            AppProfile {
+                android_package: String::new(),
+            },
+        )]),
     }
-    let changes = if dry_run {
-        changes
-            .into_iter()
-            .map(|mut change| {
-                if matches!(change.status.as_str(), "create" | "append") {
-                    change.status = "planned".to_string();
-                }
-                change
-            })
-            .collect()
+}
+
+pub fn detect_legacy_minimap(root: &Path) -> Vec<String> {
+    LEGACY_MINIMAP_PATHS
+        .iter()
+        .filter(|path| root.join(path).exists())
+        .map(|path| path.to_string())
+        .collect()
+}
+
+/// A tree is a valid lean v1 graph when the config and both graph object
+/// directories are present. A stray generic dir name (e.g. `.minimap/runs`)
+/// must not brick reads on an otherwise-valid graph, so this short-circuits the
+/// legacy guard.
+pub fn is_lean_v1_layout(root: &Path) -> bool {
+    root.join(".minimap/config.json").exists()
+        && root.join(".minimap/graph/places").exists()
+        && root.join(".minimap/graph/edges").exists()
+}
+
+pub fn run_init(root: &Path, options: InitOptions<'_>) -> Result<InitResult> {
+    let agents = parse_agents(options.agents)?;
+    let skill_paths = if options.no_skills {
+        Vec::new()
     } else {
-        changes
+        skill_paths_for_agents(&agents)
     };
+    if root.join(".minimap").exists() && !options.force {
+        // Only an *actual* legacy path warrants the destructive `--force`
+        // remediation. A lean-but-incomplete tree (missing config/places/edges
+        // but no legacy paths) is repaired non-destructively below by
+        // re-running the create steps, so it must not demand `--force`.
+        let legacy = detect_legacy_minimap(root);
+        if !legacy.is_empty() {
+            anyhow::bail!("{LEGACY_MINIMAP_MESSAGE}");
+        }
+    }
+    let mut changes = plan_init(root, &skill_paths, options.force, options.refresh_skills);
+    if !options.dry_run {
+        apply_init(root, &changes, options.force, options.refresh_skills)?;
+    } else {
+        for change in &mut changes {
+            if matches!(change.status.as_str(), "create" | "replace" | "refresh") {
+                change.status = "planned".to_string();
+            }
+        }
+    }
     Ok(InitResult {
         ok: true,
-        dry_run,
+        dry_run: options.dry_run,
         root: root
             .canonicalize()
             .unwrap_or_else(|_| root.to_path_buf())
@@ -286,108 +168,89 @@ fn skill_paths_for_agents(agents: &[String]) -> Vec<String> {
             _ => &[],
         };
         for root in roots {
-            for skill_name in [APP_NAVIGATION_SKILL_NAME, FIRST_RUN_MAPPING_SKILL_NAME] {
-                let path = format!("{root}/{skill_name}/SKILL.md");
-                if !paths.contains(&path) {
-                    paths.push(path);
-                }
+            let path = format!("{root}/{APP_NAVIGATION_SKILL_NAME}/SKILL.md");
+            if !paths.contains(&path) {
+                paths.push(path);
             }
         }
     }
     paths
 }
 
-fn plan_init(root: &Path, skill_paths: &[String]) -> Vec<InitChange> {
+fn plan_init(
+    root: &Path,
+    skill_paths: &[String],
+    force: bool,
+    refresh_skills: bool,
+) -> Vec<InitChange> {
     let mut changes = Vec::new();
+    if force && root.join(".minimap").exists() {
+        changes.push(InitChange {
+            kind: "minimap".to_string(),
+            path: ".minimap".to_string(),
+            status: "replace".to_string(),
+        });
+    }
     for dir in MINIMAP_DIRS {
         changes.push(InitChange {
             kind: "directory".to_string(),
             path: dir.to_string(),
-            status: if root.join(dir).exists() {
+            status: if root.join(dir).exists() && !force {
                 "exists"
             } else {
                 "create"
             }
             .to_string(),
-            detail: String::new(),
         });
     }
     changes.push(InitChange {
         kind: "config".to_string(),
         path: ".minimap/config.json".to_string(),
-        status: if root.join(".minimap/config.json").exists() {
+        status: if root.join(".minimap/config.json").exists() && !force {
             "exists"
         } else {
             "create"
         }
         .to_string(),
-        detail: String::new(),
-    });
-    changes.push(InitChange {
-        kind: "journal".to_string(),
-        path: ".minimap/journal.jsonl".to_string(),
-        status: if root.join(".minimap/journal.jsonl").exists() {
-            "exists"
-        } else {
-            "create"
-        }
-        .to_string(),
-        detail: String::new(),
-    });
-    let missing = missing_gitignore_entries(root);
-    changes.push(InitChange {
-        kind: "gitignore".to_string(),
-        path: ".gitignore".to_string(),
-        status: if missing.is_empty() {
-            "exists"
-        } else {
-            "append"
-        }
-        .to_string(),
-        detail: if missing.is_empty() {
-            String::new()
-        } else {
-            format!("add {}", missing.join(", "))
-        },
     });
     for path in skill_paths {
         changes.push(InitChange {
             kind: "skill".to_string(),
             path: path.clone(),
-            status: if root.join(path).exists() {
+            status: if refresh_skills {
+                "refresh"
+            } else if root.join(path).exists() {
                 "exists"
             } else {
                 "create"
             }
             .to_string(),
-            detail: String::new(),
         });
     }
     changes
 }
 
-fn apply_init(root: &Path, changes: &[InitChange]) -> Result<()> {
+fn apply_init(
+    root: &Path,
+    changes: &[InitChange],
+    force: bool,
+    refresh_skills: bool,
+) -> Result<()> {
+    if force && root.join(".minimap").exists() {
+        fs::remove_dir_all(root.join(".minimap"))?;
+    }
     for change in changes {
         let path = root.join(&change.path);
         match (change.kind.as_str(), change.status.as_str()) {
             ("directory", "create") => fs::create_dir_all(&path)?,
-            ("config", "create") => write_json(&path, &default_config())?,
-            ("journal", "create") => {
+            ("config", "create") => write_json(&path, &serde_json::to_value(default_config())?)?,
+            ("skill", "create") | ("skill", "refresh")
+                if refresh_skills || change.status == "create" =>
+            {
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&path)?;
-            }
-            ("gitignore", "append") => append_gitignore(root)?,
-            ("skill", "create") => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(path, skill_body_for_path(&change.path))?;
+                fs::write(path, APP_NAVIGATION_SKILL_BODY)?;
             }
             _ => {}
         }
@@ -395,70 +258,38 @@ fn apply_init(root: &Path, changes: &[InitChange]) -> Result<()> {
     Ok(())
 }
 
-fn skill_body_for_path(path: &str) -> &'static str {
-    if path.contains(FIRST_RUN_MAPPING_SKILL_NAME) {
-        FIRST_RUN_MAPPING_SKILL_BODY
-    } else {
-        APP_NAVIGATION_SKILL_BODY
-    }
-}
-
-pub fn missing_gitignore_entries(root: &Path) -> Vec<String> {
-    let content = fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
-    let lines: Vec<_> = content.lines().map(str::trim).collect();
-    GITIGNORE_ENTRIES
-        .iter()
-        .filter(|entry| !lines.contains(entry))
-        .map(|entry| entry.to_string())
-        .collect()
-}
-
-fn append_gitignore(root: &Path) -> Result<()> {
-    let path = root.join(".gitignore");
-    let mut content = fs::read_to_string(&path).unwrap_or_default();
-    let missing = missing_gitignore_entries(root);
-    if missing.is_empty() {
-        return Ok(());
-    }
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    if !content.trim().is_empty() {
-        content.push('\n');
-    }
-    content.push_str("# Minimap runtime artifacts\n");
-    for entry in missing {
-        content.push_str(&entry);
-        content.push('\n');
-    }
-    fs::write(path, content)?;
-    Ok(())
-}
-
-pub fn load_context(root: &Path) -> GraphContext {
-    let value = read_json(&root.join(".minimap/config.json")).unwrap_or_else(|_| default_config());
-    let context = value
-        .get("context")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    GraphContext(context)
-}
-
+#[derive(Debug, Clone)]
 pub struct Graph {
-    pub screens: BTreeMap<String, ScreenNode>,
-    pub edges: BTreeMap<String, NavigationEdge>,
-    pub routes: BTreeMap<String, Route>,
+    pub places: BTreeMap<String, Place>,
+    pub edges: BTreeMap<String, Edge>,
+}
+
+pub fn load_config(root: &Path) -> Result<MinimapConfig> {
+    let value = read_json(&root.join(".minimap/config.json"))?;
+    minimap_schemas::require_schema(&value, CONFIG_SCHEMA_VERSION)?;
+    Ok(serde_json::from_value(value)?)
 }
 
 pub fn load_graph(root: &Path) -> Result<Graph> {
+    reject_legacy_layout(root)?;
     Ok(Graph {
-        screens: load_objects(root.join(".minimap/graph/screens"), SCREEN_SCHEMA_VERSION)?,
+        places: load_objects(root.join(".minimap/graph/places"), PLACE_SCHEMA_VERSION)?,
         edges: load_objects(root.join(".minimap/graph/edges"), EDGE_SCHEMA_VERSION)?,
-        routes: load_objects(root.join(".minimap/routes"), ROUTE_SCHEMA_VERSION)?,
     })
+}
+
+fn reject_legacy_layout(root: &Path) -> Result<()> {
+    // A complete lean v1 graph is always readable, even if a stray generic dir
+    // name (e.g. `.minimap/runs`) happens to be present.
+    if is_lean_v1_layout(root) {
+        return Ok(());
+    }
+    let legacy = detect_legacy_minimap(root);
+    if legacy.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{LEGACY_MINIMAP_MESSAGE}")
+    }
 }
 
 fn load_objects<T>(dir: PathBuf, schema: &str) -> Result<BTreeMap<String, T>>
@@ -484,30 +315,73 @@ where
             );
         }
         let object: T = serde_json::from_value(value)?;
-        objects.insert(object.object_id(), object);
+        let id = object.object_id();
+        let expected = format!("{}.json", slugify(&id));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name != expected {
+            anyhow::bail!(
+                "{} has object id {id:?} but filename does not match expected {expected:?}",
+                path.display()
+            );
+        }
+        if objects.insert(id.clone(), object).is_some() {
+            anyhow::bail!("duplicate object id {id:?} in {}", dir.display());
+        }
     }
     Ok(objects)
 }
 
-pub trait HasObjectId {
+/// Filesystem-level scan of the places directory that surfaces duplicate ids
+/// and filename-vs-id mismatches for `doctor`, independent of whether the full
+/// graph deserializes. Mirrors the invariants enforced in `load_objects`.
+fn scan_place_ids(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let value = read_json(&path)?;
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            anyhow::bail!("{} is missing an id", path.display());
+        };
+        let expected = format!("{}.json", slugify(id));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name != expected {
+            anyhow::bail!(
+                "{} has place id {id:?} but filename does not match expected {expected:?}",
+                path.display()
+            );
+        }
+        if !seen.insert(id.to_string()) {
+            anyhow::bail!("duplicate place id {id:?} in {}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+trait HasObjectId {
     fn object_id(&self) -> String;
 }
 
-impl HasObjectId for ScreenNode {
+impl HasObjectId for Place {
     fn object_id(&self) -> String {
         self.id.clone()
     }
 }
 
-impl HasObjectId for NavigationEdge {
+impl HasObjectId for Edge {
     fn object_id(&self) -> String {
         self.id.clone()
-    }
-}
-
-impl HasObjectId for Route {
-    fn object_id(&self) -> String {
-        self.name.clone()
     }
 }
 
@@ -520,295 +394,136 @@ pub fn write_json(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, canonical_json(value))?;
+    write_atomic(path, canonical_json(value).as_bytes())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Write `bytes` to `path` atomically and durably: stage into a sibling temp
+/// file in the same directory, flush + `sync_all`, then rename over the final
+/// path. A crash or `ENOSPC` mid-write leaves the existing file intact instead
+/// of a truncated one that would fail the whole graph load.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let tmp = tmp_sibling_path(path);
+    // Scope the file handle so it is closed before the rename.
+    {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("create temp file {}", tmp.display()))?;
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            // Best-effort cleanup so a failed write never leaves a temp file behind.
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("write temp file {}", tmp.display()));
+        }
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
     Ok(())
 }
 
-pub fn proposal_path(root: &Path, id: &str) -> PathBuf {
-    root.join(".minimap/proposals")
-        .join(format!("{}.json", slugify(id)))
-}
-
-pub fn stage_proposal_value(root: &Path, proposal: &Value) -> Result<PathBuf> {
-    let id = proposal
-        .get("id")
-        .and_then(Value::as_str)
-        .context("proposal must include id")?;
-    let path = proposal_path(root, id);
-    write_json(&path, proposal)?;
-    Ok(path)
-}
-
-/// How `accept_proposal` should resolve a staged proposal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AcceptResolution {
-    /// Apply the proposal's `changes` array as-is. The default for every proposal kind.
-    Default,
-    /// For `selector_drift` proposals only: materialize the observed layout as a
-    /// brand-new screen and grow an edge from the source, instead of merging with
-    /// the candidate. Errors for any other proposal kind.
-    AsNew,
-}
-
-pub fn accept_proposal(
-    root: &Path,
-    id: &str,
-    resolution: AcceptResolution,
-) -> Result<Vec<PathBuf>> {
-    let value = read_json(&proposal_path(root, id))?;
-    let proposal_value = value.clone();
-    let proposal: Proposal = serde_json::from_value(value)?;
-    if proposal.schema_version != PROPOSAL_SCHEMA_VERSION {
-        anyhow::bail!(
-            "unsupported proposal schema_version {}",
-            proposal.schema_version
-        );
-    }
-    match resolution {
-        AcceptResolution::Default => {
-            let mut written = Vec::new();
-            for change in proposal.changes {
-                let object = change
-                    .get("object")
-                    .context("proposal change must include object")?;
-                let schema = object.get("schema_version").and_then(Value::as_str);
-                let path = match schema {
-                    Some(SCREEN_SCHEMA_VERSION) => commit_screen(root, object)?,
-                    Some(EDGE_SCHEMA_VERSION) => commit_edge(root, object)?,
-                    Some(ROUTE_SCHEMA_VERSION) => commit_route(root, object)?,
-                    other => anyhow::bail!("unsupported proposal object schema_version {other:?}"),
-                };
-                written.push(path);
-            }
-            Ok(written)
-        }
-        AcceptResolution::AsNew => accept_as_new(root, &proposal_value, &proposal),
-    }
-}
-
-fn accept_as_new(root: &Path, proposal_value: &Value, proposal: &Proposal) -> Result<Vec<PathBuf>> {
-    if proposal.kind != "selector_drift" {
-        anyhow::bail!(
-            "accept --as-new is only valid for selector_drift proposals (this is kind '{}')",
-            proposal.kind
-        );
-    }
-    let identity_hash = proposal_value
-        .get("identity_hash")
-        .and_then(Value::as_str)
-        .context("selector_drift proposal missing identity_hash")?;
-    let from_screen_id = proposal_value
-        .get("from_screen_id")
-        .and_then(Value::as_str)
-        .context("selector_drift proposal missing from_screen_id")?;
-    let observed_normalized = proposal_value
-        .get("observed_normalized")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let observed_layout = proposal_value
-        .get("observed_layout")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let selector_candidates = proposal_value
-        .get("selector_candidates")
-        .and_then(Value::as_array)
-        .cloned()
+fn tmp_sibling_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
         .unwrap_or_default();
-    let tap_reason = proposal_value
-        .get("tap_reason")
-        .and_then(Value::as_str)
-        .unwrap_or("learned tap");
-
-    let to_screen_id = new_screen_id(identity_hash);
-    let name = derive_screen_name(&observed_layout, &to_screen_id);
-    let screen = json!({
-        "schema_version": SCREEN_SCHEMA_VERSION,
-        "id": to_screen_id.clone(),
-        "name": name,
-        "identity_hash": identity_hash,
-        "normalized": observed_normalized,
-        "aliases": []
-    });
-    let screen_path = commit_screen(root, &screen)?;
-
-    let edge_id = edge_id_for(from_screen_id, &to_screen_id, identity_hash);
-    let edge = json!({
-        "schema_version": EDGE_SCHEMA_VERSION,
-        "id": edge_id,
-        "from_screen": from_screen_id,
-        "to_screen": to_screen_id,
-        "intent": tap_reason,
-        "action": {
-            "kind": "tap",
-            "description": tap_reason,
-            "selector_candidates": selector_candidates
-        },
-        "expectations": [{"kind": "screen_reached", "screen": to_screen_id}],
-        "learned_from": {"source": "accept_as_new"}
-    });
-    let edge_path = commit_edge(root, &edge)?;
-
-    Ok(vec![screen_path, edge_path])
-}
-
-/// Compute a stable screen handle from a SHA-256 identity hash.
-///
-/// `identity_hash` is expected in `sha256:<hex>` form; the result is `screen_<first 8 hex chars>`.
-pub fn new_screen_id(identity_hash: &str) -> String {
-    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
-    let suffix: String = hex.chars().take(8).collect();
-    format!("screen_{suffix}")
-}
-
-/// Deterministic edge handle from (from_screen, to_screen, identity_hash).
-pub fn edge_id_for(from_screen_id: &str, to_screen_id: &str, identity_hash: &str) -> String {
-    let hex = identity_hash.strip_prefix("sha256:").unwrap_or(identity_hash);
-    let suffix: String = hex.chars().take(8).collect();
-    format!("edge_{from_screen_id}__{to_screen_id}__{suffix}")
-}
-
-/// Best-effort display name derived from a raw layout JSON. Falls back to `fallback_id`.
-pub fn derive_screen_name(layout: &Value, fallback_id: &str) -> String {
-    if let Some(name) = walk_first_string(layout, &["contentDescription", "content_description"]) {
-        return name;
+    name.push(".tmp");
+    match path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
     }
-    if let Some(text) = walk_first_text(layout) {
-        return text;
-    }
-    fallback_id.to_string()
 }
 
-fn walk_first_string(value: &Value, keys: &[&str]) -> Option<String> {
-    if let Value::Object(map) = value {
-        for key in keys {
-            if let Some(Value::String(text)) = map.get(*key) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        for (_, child) in map {
-            if let Some(found) = walk_first_string(child, keys) {
-                return Some(found);
-            }
-        }
-    } else if let Value::Array(values) = value {
-        for child in values {
-            if let Some(found) = walk_first_string(child, keys) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn walk_first_text(value: &Value) -> Option<String> {
-    if let Value::Object(map) = value {
-        for key in ["text", "label", "title"] {
-            if let Some(Value::String(text)) = map.get(key) {
-                let trimmed = text.trim();
-                if trimmed.len() >= 2 && !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        for (_, child) in map {
-            if let Some(found) = walk_first_text(child) {
-                return Some(found);
-            }
-        }
-    } else if let Value::Array(values) = value {
-        for child in values {
-            if let Some(found) = walk_first_text(child) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-/// Read `navigation.post_tap_settle_ms` from `.minimap/config.json`. Defaults to 500
-/// when the file or the field is missing.
-pub fn post_tap_settle_ms(root: &Path) -> u64 {
-    let value = match read_json(&root.join(".minimap/config.json")) {
-        Ok(value) => value,
-        Err(_) => return 500,
-    };
-    value
-        .get("navigation")
-        .and_then(|nav| nav.get("post_tap_settle_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(500)
-}
-
-pub fn commit_screen(root: &Path, screen: &Value) -> Result<PathBuf> {
-    let parsed: ScreenNode = serde_json::from_value(screen.clone())?;
-    let path = root
-        .join(".minimap/graph/screens")
-        .join(format!("{}.json", screen_filename(&parsed.id)));
-    write_json(&path, screen)?;
+pub fn commit_place(root: &Path, place: &Place) -> Result<PathBuf> {
+    let path = place_path(root, &place.id);
+    write_json(&path, &serde_json::to_value(place)?)?;
     Ok(path)
 }
 
-pub fn commit_edge(root: &Path, edge: &Value) -> Result<PathBuf> {
-    let parsed: NavigationEdge = serde_json::from_value(edge.clone())?;
-    let path = root
-        .join(".minimap/graph/edges")
-        .join(format!("{}.json", edge_filename(&parsed.id)));
-    write_json(&path, edge)?;
+pub fn commit_edge(root: &Path, edge: &Edge) -> Result<PathBuf> {
+    let path = edge_path(root, &edge.id);
+    write_json(&path, &serde_json::to_value(edge)?)?;
     Ok(path)
 }
 
-pub fn commit_route(root: &Path, route: &Value) -> Result<PathBuf> {
-    let parsed: Route = serde_json::from_value(route.clone())?;
-    let path = root
-        .join(".minimap/routes")
-        .join(format!("{}.minimap.json", slugify(&parsed.name)));
-    write_json(&path, route)?;
-    Ok(path)
+pub fn place_path(root: &Path, place_id: &str) -> PathBuf {
+    root.join(".minimap/graph/places")
+        .join(format!("{}.json", slugify(place_id)))
 }
 
-pub fn screen_path(root: &Path, screen_id: &str) -> PathBuf {
-    root.join(".minimap/graph/screens")
-        .join(format!("{}.json", screen_filename(screen_id)))
+pub fn edge_path(root: &Path, edge_id: &str) -> PathBuf {
+    root.join(".minimap/graph/edges")
+        .join(format!("{}.json", slugify(edge_id)))
 }
 
-pub struct RenamedScreen {
-    pub path: PathBuf,
-    pub old_name: String,
-}
-
-pub fn rename_screen(root: &Path, screen_id: &str, new_name: &str) -> Result<RenamedScreen> {
-    let path = screen_path(root, screen_id);
-    if !path.exists() {
-        anyhow::bail!("screen '{screen_id}' not found at {}", path.display());
+pub fn remove_place_file(root: &Path, place_id: &str) -> Result<()> {
+    let path = place_path(root, place_id);
+    if path.exists() {
+        fs::remove_file(path)?;
     }
-    let mut value = read_json(&path)?;
-    let old_name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if let Value::Object(map) = &mut value {
-        map.insert("name".to_string(), Value::String(new_name.to_string()));
-    } else {
-        anyhow::bail!("screen file {} is not a JSON object", path.display());
-    }
-    commit_screen(root, &value)?;
-    Ok(RenamedScreen { path, old_name })
-}
-
-pub fn append_journal_entry(root: &Path, entry: &JournalEntry) -> Result<()> {
-    let path = root.join(".minimap/journal.jsonl");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut line = serde_json::to_string(entry)?;
-    line.push('\n');
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+pub fn validate_graph(root: &Path) -> Vec<Value> {
+    let mut checks = Vec::new();
+    let config = match load_config(root) {
+        Ok(config) => {
+            checks.push(json!({"name": "config", "status": "pass"}));
+            Some(config)
+        }
+        Err(error) => {
+            checks.push(json!({"name": "config", "status": "fail", "detail": error.to_string()}));
+            None
+        }
+    };
+    match scan_place_ids(&root.join(".minimap/graph/places")) {
+        Ok(()) => checks.push(json!({"name": "place_ids", "status": "pass"})),
+        Err(error) => {
+            checks.push(json!({"name": "place_ids", "status": "fail", "detail": error.to_string()}))
+        }
+    }
+    let graph = match load_graph(root) {
+        Ok(graph) => {
+            checks.push(json!({"name": "graph_schema", "status": "pass"}));
+            graph
+        }
+        Err(error) => {
+            checks.push(
+                json!({"name": "graph_schema", "status": "fail", "detail": error.to_string()}),
+            );
+            return checks;
+        }
+    };
+    if config.is_some() {
+        let mut slugs = BTreeSet::new();
+        let mut duplicate = None;
+        for place in graph.places.values() {
+            if !slugs.insert(place.slug.clone()) {
+                duplicate = Some(place.slug.clone());
+                break;
+            }
+        }
+        checks.push(json!({
+            "name": "unique_labels",
+            "status": if duplicate.is_none() { "pass" } else { "fail" },
+            "detail": duplicate
+        }));
+        let dangling = graph
+            .edges
+            .values()
+            .find(|edge| {
+                !graph.places.contains_key(&edge.from.id) || !graph.places.contains_key(&edge.to.id)
+            })
+            .map(|edge| edge.id.clone());
+        checks.push(json!({
+            "name": "edge_refs",
+            "status": if dangling.is_none() { "pass" } else { "fail" },
+            "detail": dangling
+        }));
+    }
+    checks
 }
 
 fn slugify(value: &str) -> String {
@@ -828,101 +543,230 @@ fn slugify(value: &str) -> String {
     }
 }
 
-fn screen_filename(id: &str) -> String {
-    let slug = slugify(id);
-    if slug.starts_with("screen_") {
-        slug
-    } else {
-        format!("screen_{slug}")
-    }
-}
-
-fn edge_filename(id: &str) -> String {
-    let slug = slugify(id);
-    if slug.starts_with("edge_") {
-        slug
-    } else {
-        format!("edge_{slug}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn init_dry_run_does_not_write() {
+    fn claude_skill_text_matches_plugin_skill_file() {
+        let skill_md = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/minimap-claude-code/skills/minimap-app-navigation/SKILL.md");
+        let contents = fs::read_to_string(&skill_md)
+            .unwrap_or_else(|err| panic!("read {}: {err}", skill_md.display()));
+        assert_eq!(
+            APP_NAVIGATION_SKILL_BODY, contents,
+            "skill text installed by init must match plugin SKILL.md"
+        );
+    }
+
+    #[test]
+    fn init_creates_minimal_layout() {
         let temp = tempfile::tempdir().unwrap();
-        let result = run_init(temp.path(), true, "all").unwrap();
+        let result = run_init(
+            temp.path(),
+            InitOptions {
+                dry_run: false,
+                agents: "codex",
+                force: false,
+                refresh_skills: false,
+                no_skills: false,
+            },
+        )
+        .unwrap();
         assert!(result.ok);
-        assert!(!temp.path().join(".minimap").exists());
-        assert!(result
-            .skill_paths
-            .contains(&".agents/skills/minimap-app-navigation/SKILL.md".to_string()));
-        assert!(result
-            .skill_paths
-            .contains(&".agents/skills/minimap-first-run-mapping/SKILL.md".to_string()));
+        assert!(temp.path().join(".minimap/config.json").exists());
+        assert!(temp.path().join(".minimap/graph/places").is_dir());
+        assert!(temp.path().join(".minimap/graph/edges").is_dir());
+        assert!(!temp.path().join(".minimap/journal.jsonl").exists());
     }
 
     #[test]
-    fn init_is_idempotent() {
+    fn init_force_replaces_old_layout() {
         let temp = tempfile::tempdir().unwrap();
-        run_init(temp.path(), false, "codex").unwrap();
-        let second = run_init(temp.path(), false, "codex").unwrap();
-        assert!(second
-            .changes
-            .iter()
-            .any(|change| change.path == ".minimap/config.json" && change.status == "exists"));
-        let gitignore = fs::read_to_string(temp.path().join(".gitignore")).unwrap();
-        assert_eq!(gitignore.matches(".minimap/journal.jsonl").count(), 1);
-        assert!(!gitignore.contains(".minimap/runs/"));
-        assert!(!gitignore.contains(".minimap/state/"));
+        fs::create_dir_all(temp.path().join(".minimap/proposals")).unwrap();
+        fs::write(temp.path().join(".minimap/old.txt"), "old").unwrap();
+        run_init(
+            temp.path(),
+            InitOptions {
+                dry_run: false,
+                agents: "codex",
+                force: true,
+                refresh_skills: false,
+                no_skills: true,
+            },
+        )
+        .unwrap();
+        assert!(!temp.path().join(".minimap/old.txt").exists());
+        assert!(temp.path().join(".minimap/graph/places").is_dir());
+    }
+
+    fn sample_place(id: &str, slug: &str) -> Place {
+        Place {
+            schema_version: PLACE_SCHEMA_VERSION.to_string(),
+            id: id.to_string(),
+            slug: slug.to_string(),
+            label: slug.to_string(),
+            baseline: minimap_schemas::PlaceBaseline {
+                identity_hash: format!("hash-{id}"),
+                fingerprint: minimap_schemas::Fingerprint {
+                    selectors: Vec::new(),
+                    static_text: Vec::new(),
+                    roles: BTreeMap::new(),
+                },
+            },
+            variants: Vec::new(),
+        }
+    }
+
+    // FIX 1: atomic writes.
+    #[test]
+    fn write_json_writes_content_and_leaves_no_temp_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested/value.json");
+        write_json(&path, &json!({"b": 2, "a": 1})).unwrap();
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written, canonical_json(&json!({"b": 2, "a": 1})));
+        // No leftover sibling temp file.
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }
 
     #[test]
-    fn post_tap_settle_ms_reads_navigation_field() {
+    fn write_json_replaces_existing_file_only_once_fully_written() {
         let temp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(temp.path().join(".minimap")).unwrap();
+        let path = temp.path().join("value.json");
+        write_json(&path, &json!({"v": 1})).unwrap();
+        write_json(&path, &json!({"v": 2})).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            canonical_json(&json!({"v": 2}))
+        );
+        // The temp sibling used for staging must not survive a successful write.
+        assert!(!tmp_sibling_path(&path).exists());
+    }
+
+    // FIX 2: duplicate ids and filename/id mismatch.
+    //
+    // Before the fix, two files carrying the same object id would silently
+    // overwrite each other in the BTreeMap (readdir order wins). The fix
+    // enforces `filename == slugify(id)`, which both flags the mismatch and
+    // makes a same-id duplicate impossible to load silently: the second file
+    // cannot also be named the canonical slug, so it trips the filename check.
+    #[test]
+    fn load_objects_rejects_two_files_sharing_an_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".minimap/graph/places");
+        fs::create_dir_all(&dir).unwrap();
+        // Both files claim id "home". Pre-fix, one would be silently dropped.
+        let canonical = sample_place("home", "home");
+        let dupe = sample_place("home", "home-dupe");
+        fs::write(
+            dir.join("home.json"),
+            canonical_json(&serde_json::to_value(&canonical).unwrap()),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("home-2.json"),
+            canonical_json(&serde_json::to_value(&dupe).unwrap()),
+        )
+        .unwrap();
+        let err = load_graph(temp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("filename does not match") || msg.contains("duplicate"),
+            "same-id duplicate must error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_objects_flags_filename_not_matching_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".minimap/graph/places");
+        fs::create_dir_all(&dir).unwrap();
+        let place = sample_place("home", "home");
+        // Filename intentionally differs from slugify(id) == "home.json".
+        fs::write(
+            dir.join("renamed.json"),
+            canonical_json(&serde_json::to_value(&place).unwrap()),
+        )
+        .unwrap();
+        let err = load_graph(temp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("filename does not match"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_graph_flags_filename_id_mismatch_via_place_ids_check() {
+        let temp = tempfile::tempdir().unwrap();
         write_json(
             &temp.path().join(".minimap/config.json"),
-            &json!({
-                "schema_version": "minimap.config.v1",
-                "navigation": { "post_tap_settle_ms": 999 }
-            }),
+            &serde_json::to_value(default_config()).unwrap(),
         )
         .unwrap();
-        assert_eq!(post_tap_settle_ms(temp.path()), 999);
+        let dir = temp.path().join(".minimap/graph/places");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(temp.path().join(".minimap/graph/edges")).unwrap();
+        let place = sample_place("home", "home");
+        fs::write(
+            dir.join("renamed.json"),
+            canonical_json(&serde_json::to_value(&place).unwrap()),
+        )
+        .unwrap();
+        let checks = validate_graph(temp.path());
+        let place_ids = checks
+            .iter()
+            .find(|c| c.get("name").and_then(Value::as_str) == Some("place_ids"))
+            .expect("place_ids check present");
+        assert_eq!(
+            place_ids.get("status").and_then(Value::as_str),
+            Some("fail"),
+            "place_ids should fail: {place_ids}"
+        );
+    }
+
+    // FIX 3: legacy detection is existence-only and over-eager.
+    #[test]
+    fn valid_lean_tree_with_stray_legacy_dir_still_loads() {
+        let temp = tempfile::tempdir().unwrap();
+        write_json(
+            &temp.path().join(".minimap/config.json"),
+            &serde_json::to_value(default_config()).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join(".minimap/graph/places")).unwrap();
+        fs::create_dir_all(temp.path().join(".minimap/graph/edges")).unwrap();
+        // A stray generic legacy dir name on an otherwise valid lean graph.
+        fs::create_dir_all(temp.path().join(".minimap/runs")).unwrap();
+        let graph = load_graph(temp.path()).expect("valid lean graph must still load");
+        assert!(graph.places.is_empty());
     }
 
     #[test]
-    fn post_tap_settle_ms_defaults_to_500_when_missing() {
+    fn init_on_lean_tree_missing_config_does_not_demand_force() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(post_tap_settle_ms(temp.path()), 500);
-    }
-
-    #[test]
-    fn init_installs_separate_first_run_mapping_skill_guidance() {
-        let temp = tempfile::tempdir().unwrap();
-        run_init(temp.path(), false, "codex").unwrap();
-        let skill = fs::read_to_string(
-            temp.path()
-                .join(".agents/skills/minimap-first-run-mapping/SKILL.md"),
+        // Lean-but-incomplete: directories exist but config.json is missing, and
+        // there are no legacy paths.
+        fs::create_dir_all(temp.path().join(".minimap/graph/places")).unwrap();
+        fs::create_dir_all(temp.path().join(".minimap/graph/edges")).unwrap();
+        let result = run_init(
+            temp.path(),
+            InitOptions {
+                dry_run: false,
+                agents: "codex",
+                force: false,
+                refresh_skills: false,
+                no_skills: true,
+            },
         )
-        .unwrap();
-        assert!(skill.contains("name: minimap-first-run-mapping"));
-        assert!(skill.contains("First-Run Mapping Mode"));
-        assert!(skill.contains("token-intensive"));
-        assert!(skill.contains("do not accept or commit"));
-        assert!(skill.contains("minimap map --discover <route-name> --max-actions 5 --stage"));
-        assert!(skill.contains("only for bounded bulk surveys"));
-        assert!(skill.contains("use `minimap-app-navigation` instead"));
-
-        let navigation_skill = fs::read_to_string(
-            temp.path()
-                .join(".agents/skills/minimap-app-navigation/SKILL.md"),
-        )
-        .unwrap();
-        assert!(navigation_skill.contains("name: minimap-app-navigation"));
-        assert!(!navigation_skill.contains("First-Run Mapping Mode"));
+        .expect("incomplete lean tree must repair without --force");
+        assert!(result.ok);
+        // The missing config was created non-destructively.
+        assert!(temp.path().join(".minimap/config.json").exists());
     }
 }

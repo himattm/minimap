@@ -4,10 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn init_dry_run_reports_without_writing() {
+fn init_creates_minimal_layout_and_skill() {
     let temp = tempfile::tempdir().unwrap();
     let output = minimap(temp.path())
-        .args(["init", "--dry-run", "--agents", "all"])
+        .args(["init", "--agents", "codex"])
         .assert()
         .success()
         .get_output()
@@ -15,224 +15,1326 @@ fn init_dry_run_reports_without_writing() {
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(payload["ok"], true);
-    assert_eq!(payload["dry_run"], true);
-    assert!(!temp.path().join(".minimap").exists());
-    assert!(payload["skill_paths"]
-        .as_array()
-        .unwrap()
-        .contains(&json!(".agents/skills/minimap-app-navigation/SKILL.md")));
-    assert!(payload["skill_paths"]
-        .as_array()
-        .unwrap()
-        .contains(&json!(".agents/skills/minimap-first-run-mapping/SKILL.md")));
-}
-
-#[test]
-fn init_does_not_create_legacy_directories() {
-    let temp = tempfile::tempdir().unwrap();
-    minimap(temp.path())
-        .args(["init", "--agents", "codex"])
-        .assert()
-        .success();
-    assert!(!temp.path().join(".minimap/runs").exists());
-    assert!(!temp.path().join(".minimap/state").exists());
-    assert!(!temp.path().join(".minimap/checks").exists());
-    assert!(!temp.path().join(".minimap/current.json").exists());
-    assert!(temp.path().join(".minimap/graph/screens").is_dir());
+    assert!(temp.path().join(".minimap/config.json").exists());
+    assert!(temp.path().join(".minimap/graph/places").is_dir());
     assert!(temp.path().join(".minimap/graph/edges").is_dir());
-    assert!(temp.path().join(".minimap/routes").is_dir());
-    assert!(temp.path().join(".minimap/proposals").is_dir());
-}
-
-#[test]
-fn init_creates_empty_journal_jsonl() {
-    let temp = tempfile::tempdir().unwrap();
-    minimap(temp.path())
-        .args(["init", "--agents", "codex"])
-        .assert()
-        .success();
-    let journal = temp.path().join(".minimap/journal.jsonl");
-    assert!(journal.exists(), "journal.jsonl should exist after init");
-    let bytes = fs::read(&journal).unwrap();
-    assert!(bytes.is_empty(), "journal.jsonl should be empty after init");
-}
-
-#[test]
-fn init_refuses_legacy_minimap_tree() {
-    let temp = tempfile::tempdir().unwrap();
-    fs::create_dir_all(temp.path().join(".minimap/runs")).unwrap();
-    let assertion = minimap(temp.path())
-        .args(["init", "--agents", "codex"])
-        .assert()
-        .code(2);
-    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
-    let payload: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(payload["status"], "config_error");
-    let summary = payload["summary"].as_str().unwrap_or_default();
-    assert!(
-        summary.contains("minimap 0.1.x"),
-        "legacy summary should mention 0.1.x, got: {summary}"
-    );
-    assert!(
-        summary.contains("--force"),
-        "legacy summary should mention --force, got: {summary}"
-    );
-    let legacy_paths = payload["legacy_paths"].as_array().unwrap();
-    assert!(legacy_paths.iter().any(|value| value == ".minimap/runs"));
-    // init must not have created the new tree on top of the legacy refusal.
-    assert!(!temp.path().join(".minimap/graph/screens").exists());
-}
-
-#[test]
-fn init_force_overwrites_legacy_tree() {
-    let temp = tempfile::tempdir().unwrap();
-    fs::create_dir_all(temp.path().join(".minimap/runs")).unwrap();
-    minimap(temp.path())
-        .args(["init", "--agents", "codex", "--force"])
-        .assert()
-        .success();
-    assert!(temp.path().join(".minimap/graph/screens").is_dir());
-    assert!(temp.path().join(".minimap/journal.jsonl").exists());
-}
-
-#[test]
-fn doctor_passes_on_fresh_init_with_journal_writable() {
-    let temp = tempfile::tempdir().unwrap();
-    minimap(temp.path())
-        .args(["init", "--agents", "codex"])
-        .assert()
-        .success();
-    let output = minimap(temp.path())
-        .args(["doctor"])
-        .assert()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    let checks = payload["checks"].as_array().unwrap();
-    let journal_check = checks
-        .iter()
-        .find(|check| check["name"] == "journal_writable")
-        .expect("doctor should emit a journal_writable check");
-    assert_eq!(journal_check["status"], "ok");
-    let graph_dirs = checks
-        .iter()
-        .find(|check| check["name"] == "graph_dirs")
-        .expect("doctor should emit a graph_dirs check");
-    assert_eq!(graph_dirs["status"], "pass");
-}
-
-#[test]
-fn doctor_warns_when_graph_not_git_tracked() {
-    let temp = tempfile::tempdir().unwrap();
-    minimap(temp.path())
-        .args(["init", "--agents", "codex"])
-        .assert()
-        .success();
-    // Git doesn't track empty directories, and `init` produces empty graph/routes dirs.
-    // So an init'd repo with only a baseline commit will not have any graph files tracked.
-    init_git_repo_with_baseline(temp.path());
-    let output = minimap(temp.path())
-        .args(["doctor"])
-        .assert()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    let checks = payload["checks"].as_array().unwrap();
-    let graph_tracked = checks
-        .iter()
-        .find(|check| check["name"] == "graph_tracked")
-        .expect("doctor should emit a graph_tracked check");
-    assert_eq!(graph_tracked["status"], "warn");
-    assert!(
-        payload["hint"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("git add .minimap/graph .minimap/routes"),
-        "doctor should surface the git add hint when graph is untracked, got: {payload}"
-    );
-}
-
-#[test]
-fn claude_plugin_marketplace_declares_minimap_skills() {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let marketplace = read_json_path(&repo.join(".claude-plugin/marketplace.json"));
-    assert_eq!(marketplace["name"], "minimap");
-    assert_eq!(marketplace["owner"]["name"], "Matt McKenna");
-    assert_eq!(marketplace["plugins"][0]["name"], "minimap");
-    assert_eq!(marketplace["plugins"][0]["author"]["name"], "Matt McKenna");
-    assert_eq!(
-        marketplace["plugins"][0]["source"],
-        "./plugins/minimap-claude-code"
-    );
-
-    let plugin =
-        read_json_path(&repo.join("plugins/minimap-claude-code/.claude-plugin/plugin.json"));
-    assert_eq!(plugin["name"], "minimap");
-    assert_eq!(plugin["author"]["name"], "Matt McKenna");
-
-    let app_nav_skill = fs::read_to_string(
-        repo.join("plugins/minimap-claude-code/skills/minimap-app-navigation/SKILL.md"),
-    )
-    .unwrap();
-    assert!(app_nav_skill.contains("map the whole app"));
-    assert!(app_nav_skill.contains("first-run mapping"));
-    assert!(app_nav_skill.contains("token-intensive"));
-
-    assert!(!repo
-        .join("plugins/minimap-claude-code/skills/minimap-first-run-mapping")
+    assert!(!temp.path().join(".minimap/journal.jsonl").exists());
+    assert!(!temp.path().join(".minimap/proposals").exists());
+    assert!(temp
+        .path()
+        .join(".agents/skills/minimap-app-navigation/SKILL.md")
         .exists());
 }
 
 #[test]
-#[ignore = "TODO(phase-2): route-level context_guard was removed from the Route schema; this test asserts the old behavior."]
-fn route_reports_context_mismatch_exit_code() {
+fn init_refuses_legacy_layout_without_force() {
     let temp = tempfile::tempdir().unwrap();
-    write_json(
-        &temp.path().join(".minimap/config.json"),
-        &json!({
-            "schema_version": "minimap.config.v1",
-            "context": {"auth_state": "logged_out"}
-        }),
-    );
-    write_json(
-        &temp
-            .path()
-            .join(".minimap/routes/open-account.minimap.json"),
-        &json!({
-            "schema_version": "minimap.route.v1",
-            "name": "open-account",
-            "start": {"screen": "home", "context_guard": {"auth_state": "logged_in"}},
-            "target": {"screen": "account"}
-        }),
-    );
-    let output = minimap(temp.path())
-        .args(["route", "open-account", "--current-screen", "home"])
+    fs::create_dir_all(temp.path().join(".minimap/proposals")).unwrap();
+    let assertion = minimap(temp.path())
+        .args(["init", "--agents", "codex"])
         .assert()
-        .code(8)
+        .failure();
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "config_error");
+    assert!(payload["summary"]
+        .as_str()
+        .unwrap()
+        .contains("incompatible pre-lean-v1"));
+}
+
+#[test]
+fn init_force_replaces_legacy_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(temp.path().join(".minimap/proposals")).unwrap();
+    fs::write(temp.path().join(".minimap/stale.txt"), "stale").unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex", "--force"])
+        .assert()
+        .success();
+    assert!(!temp.path().join(".minimap/stale.txt").exists());
+    assert!(temp.path().join(".minimap/graph/places").is_dir());
+}
+
+#[test]
+fn help_exposes_only_lean_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = minimap(temp.path())
+        .args(["--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8_lossy(&output);
+    for command in ["whereami", "go", "tap", "scroll", "back", "layout"] {
+        assert!(help.contains(command), "help should contain {command}");
+    }
+    for removed in [
+        "  accept",
+        "  route",
+        "  screen",
+        "  observe",
+        "  learn",
+        "  undo",
+        "  validate",
+    ] {
+        assert!(
+            !help.contains(removed),
+            "help must not contain removed command {removed}"
+        );
+    }
+}
+
+#[test]
+fn whereami_label_creates_place() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script(&bin);
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "Home"])
+        .assert()
+        .success()
         .get_output()
         .stdout
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "context_mismatch");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["place"]["slug"], "home");
+    assert_eq!(payload["changed_graph"], true);
+    assert!(temp
+        .path()
+        .join(".minimap/graph/places/place_home.json")
+        .exists());
 }
 
 #[test]
-fn layout_diff_uses_fake_android_cli() {
+fn whereami_existing_label_on_unknown_layout_does_not_claim_place() {
     let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
     let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ] && [ "$2" = "--diff" ]; then
-  printf '{"changed":[{"text":"Settings"}]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
+    write_android_layout_script(&bin, &["home", "blank"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .code(2);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "label_mismatch");
+    assert_eq!(payload["place"], Value::Null);
+}
+
+#[test]
+fn tap_selector_with_label_creates_destination_and_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
     let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["from"], "home");
+    assert_eq!(payload["data"]["to"], "search");
+    assert!(temp
+        .path()
+        .join(".minimap/graph/places/place_search.json")
+        .exists());
+    let edges: Vec<_> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert_eq!(edges.len(), 1);
+    let edge = read_json_path(&edges[0].path());
+    assert_eq!(edge["from"]["slug"], "home");
+    assert_eq!(edge["to"]["slug"], "search");
+    assert_eq!(
+        edge["recipe"][0]["selector"],
+        json!({"kind": "text", "value": "SEARCH"})
+    );
+}
+
+#[test]
+fn tap_retries_blank_post_action_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "blank", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+
+    let search = read_json_path(&temp.path().join(".minimap/graph/places/place_search.json"));
+    assert!(serde_json::to_string(&search["baseline"])
+        .unwrap()
+        .contains("Categories"));
+}
+
+#[test]
+fn tap_existing_label_adds_variant_without_replacing_baseline() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search", "search", "home_changed"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=HOME",
+            "--label",
+            "home",
+            "--reason",
+            "open home",
+        ])
+        .assert()
+        .success();
+
+    let home = read_json_path(&temp.path().join(".minimap/graph/places/place_home.json"));
+    let baseline = serde_json::to_string(&home["baseline"]).unwrap();
+    let variants = serde_json::to_string(&home["variants"]).unwrap();
+    assert!(!baseline.contains("Featured today"));
+    assert!(variants.contains("Featured today"));
+}
+
+#[test]
+fn tap_unknown_destination_without_label_does_not_write_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search"]);
+    write_adb_script(&bin);
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .code(5);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "needs_label");
+    assert!(!temp
+        .path()
+        .join(".minimap/graph/places/place_search.json")
+        .exists());
+    let edge_count = fs::read_dir(temp.path().join(".minimap/graph/edges"))
+        .unwrap()
+        .count();
+    assert_eq!(edge_count, 0);
+}
+
+// FIX 5: a malformed --point value must be a guaranteed no-op. Before the fix,
+// the value was parsed only after observe/orient (which can self-heal-write the
+// drifted place), so a bad coordinate could still mutate the graph. The drifted
+// `home_changed` layout below would self-heal place_home into a variant if the
+// orientation ran before the parse error.
+#[test]
+fn tap_malformed_point_is_config_error_and_leaves_graph_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home_changed"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+
+    let place_path = temp.path().join(".minimap/graph/places/place_home.json");
+    let before = fs::read_to_string(&place_path).unwrap();
+
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["tap", "--point", "bogus", "--label", "search"])
+        .assert()
+        // Malformed value -> bail!() -> main() catch-all -> config_error -> 7.
+        .code(7);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "config_error");
+
+    let after = fs::read_to_string(&place_path).unwrap();
+    assert_eq!(before, after, "malformed --point must not mutate the graph");
+    assert!(
+        !after.contains("Featured today"),
+        "drifted variant must not have been self-healed in: {after}"
+    );
+    assert_eq!(edge_count(temp.path()), 0);
+}
+
+#[test]
+fn go_replays_known_selector_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search", "home", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "search"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["target"], "search");
+    assert_eq!(payload["data"]["start_source"], "session");
+    assert_eq!(payload["data"]["executed_steps"][0]["to"], "search");
+}
+
+// REDACTION/GEOMETRY REGRESSION: real `android layout` output encodes geometry
+// as STRINGS ("center":"[540,2200]", "bounds":"[480,2100][600,2300]") whose
+// digit count trips the numeric-sensitive redaction screen. `go` seeds selector
+// resolution from the REDACTED session-cache layout, so if redaction destroys
+// the geometry strings, replay fails live with "matched node has no tap bounds"
+// (action_failed) even though the object-geometry fakes above stay green.
+#[test]
+fn go_replays_selector_edge_from_string_geometry_session_cache() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(
+        &bin,
+        &[
+            "home_geo",
+            "home_geo",
+            "search_geo",
+            "home_geo",
+            "search_geo",
+        ],
+    );
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+    // Re-orient onto home so the session cache holds the (redacted) home layout
+    // with its string geometry; `go` must resolve the tap point from it.
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "search"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["target"], "search");
+    assert_eq!(payload["data"]["start_source"], "session");
+    assert_eq!(payload["data"]["executed_steps"][0]["to"], "search");
+}
+
+// KNOWN-EXITS REGRESSION: whereami hard-coded include_exits=false on both the
+// fresh and the session-cache paths, so `known_exits` was always [] even when
+// the oriented place had outgoing edges.
+#[test]
+fn whereami_reports_known_exits_on_fresh_and_cached_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search", "home"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    // Establish one outgoing edge home -> search.
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+
+    // Fresh path: a label bypasses the session cache, so this re-observes the
+    // home layout and must report the recorded exit.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["place"]["slug"], "home");
+    assert_eq!(payload.get("cache"), None);
+    let exits = payload["known_exits"].as_array().unwrap();
+    assert_eq!(exits.len(), 1, "fresh whereami must list the known exit");
+    assert_eq!(exits[0]["to"], "search");
+    assert_eq!(exits[0]["intent"], "open search");
+    assert!(exits[0]["edge"].as_str().is_some());
+
+    // Cache-hit path: the label-less rerun reuses the fresh session place and
+    // must carry the same exits.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["cache"]["hit"], true);
+    let exits = payload["known_exits"].as_array().unwrap();
+    assert_eq!(exits.len(), 1, "cached whereami must list the known exit");
+    assert_eq!(exits[0]["to"], "search");
+}
+
+#[test]
+fn whereami_reuses_fresh_verified_session_place() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(
+        &bin,
+        &["home", "home", "search", "home", "search", "home_changed"],
+    );
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "search"])
+        .assert()
+        .success();
+
+    let count_after_go = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count_after_go, "5");
+
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["place"]["slug"], "search");
+    assert_eq!(payload["cache"]["hit"], true);
+    assert_eq!(payload["metrics"]["layout_calls_total"], 0);
+    let count_after_whereami = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count_after_whereami, "5");
+}
+
+#[test]
+fn layout_reuses_fresh_verified_session_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(
+        &bin,
+        &["home", "home", "search", "home", "search", "home_changed"],
+    );
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "search"])
+        .assert()
+        .success();
+
+    let count_after_go = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count_after_go, "5");
+
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["cache"]["hit"], true);
+    assert_eq!(payload["metrics"]["layout_calls_total"], 0);
+    assert!(serde_json::to_string(&payload["layout"])
+        .unwrap()
+        .contains("Categories"));
+    let count_after_layout = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count_after_layout, "5");
+}
+
+#[test]
+fn layout_returns_redacted_layout_and_minimap_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["email"]);
+    write_adb_script(&bin);
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert!(payload["minimap"]["status"].as_str().is_some());
+    let serialized = serde_json::to_string(&payload["layout"]).unwrap();
+    assert!(!serialized.contains("alice@example.com"));
+}
+
+#[test]
+fn doctor_reports_healthy_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script(&bin);
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["repo_ok"], true);
+    assert_eq!(payload["device_ok"], true);
+}
+
+#[test]
+fn doctor_unhealthy_when_config_invalid_exits_one() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    // Corrupt the config so the repo health check fails.
+    fs::write(temp.path().join(".minimap/config.json"), "{ not json").unwrap();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script(&bin);
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor"])
+        .assert()
+        // config_error routes through exit_code_for_status -> 7, matching whereami/go.
+        .code(7);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["repo_ok"], false);
+    assert_eq!(payload["status"], "config_error");
+}
+
+#[test]
+fn doctor_unhealthy_when_device_not_ready_exits_one() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_offline(&bin);
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor"])
+        .assert()
+        // config_error routes through exit_code_for_status -> 7, matching whereami/go.
+        .code(7);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["device_ok"], false);
+    // The repo itself is fine; only the device readiness check fails.
+    assert_eq!(payload["repo_ok"], true);
+}
+
+#[test]
+fn scroll_on_same_known_place_records_no_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "home", "home"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["scroll", "--direction", "down"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["changed_graph"], false);
+    // Staying on the same known place must not commit a navigation edge.
+    assert_eq!(edge_count(temp.path()), 0);
+}
+
+#[test]
+fn scroll_between_known_places_records_direction_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "search", "home", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "search"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["scroll", "--direction", "down"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["from"], "home");
+    assert_eq!(payload["data"]["to"], "search");
+
+    let edges = edge_files(temp.path());
+    assert_eq!(edges.len(), 1);
+    let edge = read_json_path(&edges[0]);
+    assert_eq!(edge["from"]["slug"], "home");
+    assert_eq!(edge["to"]["slug"], "search");
+    let step = &edge["recipe"][0];
+    assert_eq!(step["kind"], "scroll");
+    // The navigation identity is the direction, not any swipe coordinates.
+    assert_eq!(step["direction"], "down");
+    assert_eq!(step["point"], Value::Null);
+    assert_eq!(step["selector"], Value::Null);
+}
+
+#[test]
+fn back_between_known_places_records_press_back_edge() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "search", "search", "home"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "search"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["back"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["from"], "search");
+    assert_eq!(payload["data"]["to"], "home");
+
+    let edges = edge_files(temp.path());
+    assert_eq!(edges.len(), 1);
+    let edge = read_json_path(&edges[0]);
+    assert_eq!(edge["from"]["slug"], "search");
+    assert_eq!(edge["to"]["slug"], "home");
+    assert_eq!(edge["recipe"][0]["kind"], "press_back");
+}
+
+#[test]
+fn tap_point_records_geometry_edge_with_point_and_viewport() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--point",
+            "150,300",
+            "--label",
+            "search",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["data"]["to"], "search");
+
+    let edges = edge_files(temp.path());
+    assert_eq!(edges.len(), 1);
+    let step = &read_json_path(&edges[0])["recipe"][0];
+    assert_eq!(step["kind"], "tap");
+    assert_eq!(step["point"], json!({"x": 150, "y": 300}));
+    assert_eq!(step["viewport"], json!({"width": 1080, "height": 2400}));
+}
+
+#[test]
+fn go_refuses_geometry_edge_at_mismatched_viewport() {
+    // A geometry tap is recorded at one viewport; replaying it at a different
+    // viewport must NOT replay raw pixels. The path planner pre-filters the
+    // viewport-incompatible geometry edge, so `go` reports no_compatible_path
+    // (the defence-in-depth `action_failed` guard inside execute_recipe is
+    // unreachable from the CLI because plan and replay share one adb/viewport).
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search", "home"]);
+    write_adb_script_with_size(&bin, "1080x2400");
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["tap", "--point", "150,300", "--label", "search"])
+        .assert()
+        .success();
+    // Re-orient to home so the session start point is home (not the search
+    // destination), forcing `go` to plan the recorded geometry edge.
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+
+    let edges_before = edge_count(temp.path());
+    // Now the device reports a different viewport.
+    write_adb_script_with_size(&bin, "720x1600");
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "search"])
+        .assert()
+        .code(5);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "no_compatible_path");
+    assert_eq!(payload["data"]["changed_graph"], false);
+    assert_eq!(edge_count(temp.path()), edges_before);
+}
+
+#[test]
+fn tap_point_without_display_size_is_environment_error() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home"]);
+    write_adb_script_no_display(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["tap", "--point", "150,300", "--label", "search"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "environment_error");
+    assert!(!temp
+        .path()
+        .join(".minimap/graph/places/place_search.json")
+        .exists());
+    assert_eq!(edge_count(temp.path()), 0);
+}
+
+#[test]
+fn whereami_relabel_preserves_baseline_and_repoints_edges() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    // alpha establishes the baseline; alpha_drift is a still-matching variant
+    // observed during the relabel; beta is an edge destination off of alpha.
+    write_android_layout_script(&bin, &["alpha", "alpha", "beta", "alpha_drift"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "alpha"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "testTag=alpha_btn",
+            "--label",
+            "beta",
+            "--reason",
+            "open beta",
+        ])
+        .assert()
+        .success();
+
+    // Capture the original baseline hash before relabel.
+    let alpha_before = read_json_path(&temp.path().join(".minimap/graph/places/place_alpha.json"));
+    let original_hash = alpha_before["baseline"]["identity_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "homescreen"])
+        .assert()
+        .success();
+
+    // Old place id removed; new slug present.
+    assert!(!temp
+        .path()
+        .join(".minimap/graph/places/place_alpha.json")
+        .exists());
+    let relabeled = read_json_path(
+        &temp
+            .path()
+            .join(".minimap/graph/places/place_homescreen.json"),
+    );
+    // KEY: baseline preserved, drift recorded as a variant (NOT overwriting it).
+    assert_eq!(relabeled["baseline"]["identity_hash"], original_hash);
+    let variants = relabeled["variants"].as_array().unwrap();
+    assert_eq!(variants.len(), 1);
+    assert_ne!(variants[0]["identity_hash"], json!(original_hash));
+    let baseline_text = serde_json::to_string(&relabeled["baseline"]).unwrap();
+    let variants_text = serde_json::to_string(&relabeled["variants"]).unwrap();
+    assert!(!baseline_text.contains("Status updated"));
+    assert!(variants_text.contains("Status updated"));
+
+    // The edge was repointed from the old slug to the new one.
+    let edges = edge_files(temp.path());
+    assert_eq!(edges.len(), 1);
+    let edge = read_json_path(&edges[0]);
+    assert_eq!(edge["from"]["slug"], "homescreen");
+    assert_eq!(edge["from"]["id"], "place_homescreen");
+    assert_eq!(edge["to"]["slug"], "beta");
+}
+
+#[test]
+fn tap_label_reaching_a_different_known_place_is_label_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "settings", "home", "settings"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "settings"])
+        .assert()
+        .success();
+    // Tap from home asking for "home" but the post layout is the known settings.
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["tap", "--selector", "text=SEARCH", "--label", "home"])
+        .assert()
+        .code(2);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "label_mismatch");
+    assert_eq!(payload["data"]["observed"], "settings");
+    assert_eq!(payload["data"]["requested_label"], "home");
+    assert_eq!(payload["data"]["changed_graph"], false);
+    assert_eq!(edge_count(temp.path()), 0);
+}
+
+#[test]
+fn whereami_label_collision_is_mismatch_but_allow_duplicate_suffixes_a_new_place() {
+    // A NEW, distinct fingerprint (`settings`) whose requested label slug
+    // ("home") is already owned by a DIFFERENT place. By default this is a
+    // label_mismatch with no write; under --allow-duplicate-label the new place
+    // is committed with the smallest free numeric suffix (place_home-2). This
+    // locks the Tranche C collision policy: slugs never silently merge two
+    // distinct screens.
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    // home (label home) -> settings (label home, collision) x2 for the retry.
+    write_android_layout_script(&bin, &["home", "settings", "settings"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+
+    // Default: the distinct settings screen labeled "home" is a label_mismatch.
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .code(2);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "label_mismatch");
+    assert!(
+        !temp
+            .path()
+            .join(".minimap/graph/places/place_home-2.json")
+            .exists(),
+        "no suffixed place should be written without the flag"
+    );
+
+    // With --allow-duplicate-label: commit a fresh suffixed place_home-2.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home", "--allow-duplicate-label"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["place"]["slug"], "home-2");
+    assert_eq!(payload["changed_graph"], true);
+    assert!(temp
+        .path()
+        .join(".minimap/graph/places/place_home.json")
+        .exists());
+    assert!(temp
+        .path()
+        .join(".minimap/graph/places/place_home-2.json")
+        .exists());
+}
+
+#[test]
+fn tap_unknown_destination_keeps_pending_out_of_minimap_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .code(5);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "needs_label");
+    assert!(!temp
+        .path()
+        .join(".minimap/graph/places/place_search.json")
+        .exists());
+    assert_eq!(edge_count(temp.path()), 0);
+    // The unconfirmed pending transition must never be written under .minimap.
+    let stray = find_files_containing(&temp.path().join(".minimap"), "pending");
+    assert!(
+        stray.is_empty(),
+        "found pending state in .minimap: {stray:?}"
+    );
+}
+
+#[test]
+fn go_with_broken_selector_edge_fails_without_writing_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    // nav -> other via a tap on testTag=go_search. nav_drift still matches nav
+    // (known_changed) but the go_search node is gone, so the selector cannot
+    // resolve on replay.
+    write_android_layout_script(&bin, &["nav", "nav", "other", "nav_drift"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "nav"])
+        .assert()
+        .success();
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "testTag=go_search",
+            "--label",
+            "other",
+            "--reason",
+            "open other",
+        ])
+        .assert()
+        .success();
+    // Re-orient onto the drifted nav layout (records it as a nav variant and
+    // points the session at nav with the drifted layout cached).
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "nav"])
+        .assert()
+        .success();
+
+    let edges_before = edge_count(temp.path());
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["go", "other"])
+        .assert()
+        .code(2);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "action_failed");
+    assert_eq!(payload["data"]["changed_graph"], false);
+    assert_eq!(edge_count(temp.path()), edges_before);
+}
+
+#[test]
+fn tap_into_permission_overlay_is_blocked_without_writing_graph() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home", "permission"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let assertion = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "text=SEARCH",
+            "--reason",
+            "open search",
+        ])
+        .assert()
+        .code(2);
+    let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "blocked_by_overlay");
+    assert_eq!(payload["data"]["reason"], "permission_dialog");
+    assert_eq!(payload["data"]["changed_graph"], false);
+    assert_eq!(edge_count(temp.path()), 0);
+    // Only the home place exists; the overlay must not become a place.
+    assert_eq!(place_count(temp.path()), 1);
+    let stray = find_files_containing(&temp.path().join(".minimap"), "pending");
+    assert!(
+        stray.is_empty(),
+        "overlay must not leave pending state: {stray:?}"
+    );
+}
+
+#[test]
+fn layout_diff_and_plain_layout_report_distinct_kinds() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home", "home"]);
+    write_adb_script(&bin);
+
+    let diff_output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
         .args(["layout", "--diff"])
         .assert()
@@ -240,421 +1342,95 @@ exit 2
         .get_output()
         .stdout
         .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["kind"], "android_layout_diff");
-    assert_eq!(payload["diff_scope"], "android_in_session");
-}
+    let diff: Value = serde_json::from_slice(&diff_output).unwrap();
+    assert_eq!(diff["kind"], "android_layout_diff");
+    // Diffs carry no orientation/cache state.
+    assert_eq!(diff["minimap"]["orientation"], "unavailable_for_diff");
+    assert_eq!(diff["minimap"]["place"], Value::Null);
 
-#[test]
-fn tap_coordinate_journals_without_growing_graph() {
-    let temp = tempfile::tempdir().unwrap();
-    let bin = fake_bin(temp.path());
-    // The atomic tap fetches a pre-layout for from-screen classification before executing.
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ]; then
-  printf '{"class":"Column","children":[]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
+    let plain_output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["tap", "--point", "540,1200", "--reason", "header"])
+        .args(["layout"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["outcome"], "coord_journal_only");
-    assert!(!temp.path().join(".minimap/graph/edges").exists()
-        || fs::read_dir(temp.path().join(".minimap/graph/edges"))
-            .map(|entries| entries.count())
-            .unwrap_or(0)
-            == 0);
-    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
-    assert_eq!(journal.lines().count(), 1);
-    assert!(journal.contains("coord_journal_only"));
+    let plain: Value = serde_json::from_slice(&plain_output).unwrap();
+    assert_eq!(plain["kind"], "android_layout");
+    // Plain layout carries orientation metadata (a fingerprint identity hash).
+    assert!(plain["minimap"]["match"]["identity_hash"]
+        .as_str()
+        .is_some());
+    assert!(plain["minimap"]["status"].as_str().is_some());
 }
 
 #[test]
-fn go_executes_route_edges_with_fake_android_and_adb() {
+fn whereami_clears_stale_session_pointing_at_missing_place() {
     let temp = tempfile::tempdir().unwrap();
-    write_json(
-        &temp
-            .path()
-            .join(".minimap/graph/screens/screen_article_detail.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_article_detail",
-            "name": "article-detail",
-            "identity_hash": "sha256:not-fast-path",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [
-                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                    {"role": "Text", "clickable": false, "enabled": true, "path": "0/0", "sibling_bucket": 0, "text_class": "medium"}
-                ],
-                "role_distribution": {"Column": 1, "Text": 1},
-                "element_count": 2
-            }
-        }),
-    );
-    write_json(
-        &temp
-            .path()
-            .join(".minimap/graph/edges/edge_home_article.json"),
-        &json!({
-            "schema_version": "minimap.edge.v1",
-            "id": "edge_home_article",
-            "from_screen": "screen_home",
-            "to_screen": "screen_article_detail",
-            "action": {
-                "kind": "tap",
-                "selector_candidates": [
-                    {"kind": "test_tag", "value": "read_article", "score": 0.92}
-                ]
-            }
-        }),
-    );
-    write_json(
-        &temp
-            .path()
-            .join(".minimap/routes/read-article.minimap.json"),
-        &json!({
-            "schema_version": "minimap.route.v1",
-            "name": "read-article",
-            "start": {"screen": "screen_home"},
-            "target": {"screen": "screen_article_detail"},
-            "preferred_edge_ids": ["edge_home_article"]
-        }),
-    );
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ]; then
-    printf '{"class":"Column","children":[{"testTag":"read_article","bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ] && [ "$4" = "200" ] && [ "$5" = "300" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["go", "read-article", "--current-screen", "screen_home"])
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["summary"], "route executed");
-    assert_eq!(payload["executed"][0]["edge"], "edge_home_article");
-    assert_eq!(
-        payload["executed"][0]["verification"]["matched_screen"],
-        "screen_article_detail"
-    );
-    assert_eq!(payload["metrics"]["layout_calls_total"], 2);
-    assert_eq!(payload["metrics"]["layout_json_returned_to_agent"], false);
-    assert_eq!(payload["metrics"]["adb_taps_total"], 1);
-}
-
-#[test]
-fn drift_passes_for_known_current_screen() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
+        .success();
     let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ]; then
-  printf '{"class":"Column","children":[{"class":"Button","testTag":"settings","clickable":true}]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
+    write_android_layout_script(&bin, &["home", "home"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["drift"])
+        .args(["whereami", "--label", "home"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "passed");
-    assert_eq!(
-        payload["current_screen"]["matched_screen"],
-        "screen_settings"
-    );
-}
+        .success();
+    // Remove the place the fresh session points at, leaving a dangling session.
+    fs::remove_file(temp.path().join(".minimap/graph/places/place_home.json")).unwrap();
 
-#[test]
-fn validate_reports_screen_unknown_and_stages_proposal() {
-    let temp = tempfile::tempdir().unwrap();
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ]; then
-  printf '{"class":"Column","children":[{"class":"Button","testTag":"unknown","clickable":true}]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["validate"])
+        .args(["whereami"])
         .assert()
         .code(5)
         .get_output()
         .stdout
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "screen_unknown");
-    assert!(payload["drift"]["proposal_path"].as_str().is_some());
+    // The stale session is dropped and a fresh observation finds no place.
+    assert_eq!(payload["status"], "unknown");
+    assert_eq!(payload.get("cache"), None);
+    // A real layout call was made (count advanced past the first whereami).
+    let count = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count, "2");
 }
 
 #[test]
-fn validate_all_is_dry_by_default() {
+fn serial_flag_threads_serial_through_every_adb_and_android_call() {
     let temp = tempfile::tempdir().unwrap();
-    write_home_to_article_graph(temp.path());
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ]; then
-  printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["validate", "--all", "--current-screen", "screen_home"])
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "passed");
-    assert_eq!(payload["impact_analysis"]["precise"], false);
-    assert!(payload["route_results"].is_null());
-}
-
-#[test]
-fn validate_all_execute_runs_matching_route() {
-    let temp = tempfile::tempdir().unwrap();
-    write_home_to_article_graph(temp.path());
+        .success();
     let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/validate-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ] && [ "$4" = "200" ] && [ "$5" = "300" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
+    // Both fakes exit 1 unless the serial arrives: adb requires `-s` before
+    // every subcommand and android requires `--device=` on layout, so any
+    // serial-less call fails the whole flow.
+    write_android_layout_script_expect_serial(&bin, &["home", "home", "search"], "emulator-5554");
+    write_adb_script_expect_serial(&bin, "emulator-5554");
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home", "--serial", "emulator-5554"])
+        .assert()
+        .success();
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
         .args([
-            "validate",
-            "--all",
-            "--execute",
-            "--current-screen",
-            "screen_home",
+            "tap",
+            "--point",
+            "150,300",
+            "--label",
+            "search",
+            "--serial",
+            "emulator-5554",
         ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "passed");
-    assert_eq!(payload["impact_analysis"]["precise"], true);
-    assert_eq!(payload["route_results"][0]["route"], "read-article");
-    assert_eq!(
-        payload["route_results"][0]["result"]["final_screen"]["matched_screen"],
-        "screen_article_detail"
-    );
-}
-
-#[test]
-fn route_define_writes_slim_route_json() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    minimap(temp.path())
-        .args([
-            "route",
-            "define",
-            "open-settings",
-            "--to",
-            "screen_settings",
-            "--triggers",
-            "Settings*.kt",
-            "--triggers",
-            "*Preferences*",
-        ])
-        .assert()
-        .success();
-    let route_path = temp
-        .path()
-        .join(".minimap/routes/open-settings.minimap.json");
-    assert!(route_path.exists(), "route file should be written");
-    let route: Value = serde_json::from_str(&fs::read_to_string(&route_path).unwrap()).unwrap();
-    assert_eq!(route["schema_version"], "minimap.route.v1");
-    assert_eq!(route["name"], "open-settings");
-    assert_eq!(route["target"]["screen"], "screen_settings");
-    assert!(route.get("from").is_none() || route["from"].is_null());
-    let triggers = route["triggers"].as_array().unwrap();
-    assert_eq!(triggers.len(), 2);
-    assert_eq!(triggers[0], "Settings*.kt");
-    assert_eq!(triggers[1], "*Preferences*");
-    assert!(route["aliases"].as_array().unwrap().is_empty());
-    // Phase 1 schema must not include legacy fields.
-    assert!(route.get("preferred_edge_ids").is_none());
-    assert!(route.get("allow_graph_fallback").is_none());
-    assert!(route.get("path_constraints").is_none());
-    assert!(route.get("checks").is_none());
-}
-
-#[test]
-fn route_define_errors_when_target_screen_missing() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    let assertion = minimap(temp.path())
-        .args([
-            "route",
-            "define",
-            "missing-target",
-            "--to",
-            "screen_does_not_exist",
-        ])
-        .assert()
-        .failure();
-    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
-    let payload: Value = serde_json::from_str(&stdout).unwrap();
-    let error_msg = payload["data"]["error"]["message"]
-        .as_str()
-        .or_else(|| payload["summary"].as_str())
-        .unwrap_or_default();
-    assert!(
-        error_msg.contains("screen_does_not_exist"),
-        "expected error message to name the missing screen, got: {error_msg}"
-    );
-    assert!(!temp
-        .path()
-        .join(".minimap/routes/missing-target.minimap.json")
-        .exists());
-}
-
-#[test]
-fn screen_rename_updates_name_field() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    minimap(temp.path())
-        .args(["screen", "rename", "screen_settings", "Preferences"])
-        .assert()
-        .success();
-    let screen: Value = serde_json::from_str(
-        &fs::read_to_string(
-            temp.path()
-                .join(".minimap/graph/screens/screen_settings.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(screen["id"], "screen_settings");
-    assert_eq!(screen["name"], "Preferences");
-}
-
-#[test]
-fn screen_rename_does_not_touch_edges() {
-    let temp = tempfile::tempdir().unwrap();
-    write_home_to_article_graph(temp.path());
-    let edge_path = temp
-        .path()
-        .join(".minimap/graph/edges/edge_home_article.json");
-    let original_bytes = fs::read(&edge_path).unwrap();
-    minimap(temp.path())
-        .args(["screen", "rename", "screen_home", "landing"])
-        .assert()
-        .success();
-    let after_bytes = fs::read(&edge_path).unwrap();
-    assert_eq!(
-        original_bytes, after_bytes,
-        "rename should not modify edge files"
-    );
-}
-
-#[test]
-fn undo_drops_uncommitted_graph_changes() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    init_git_repo_with_baseline(temp.path());
-    let screen_path = temp
-        .path()
-        .join(".minimap/graph/screens/screen_settings.json");
-    let original = fs::read_to_string(&screen_path).unwrap();
-    fs::write(&screen_path, "{\"tampered\":true}\n").unwrap();
-    let output = minimap(temp.path())
-        .args(["undo"])
         .assert()
         .success()
         .get_output()
@@ -662,37 +1438,31 @@ fn undo_drops_uncommitted_graph_changes() {
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(payload["status"], "ok");
-    assert!(
-        payload["summary"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("dropped"),
-        "summary should mention dropped changes: {payload}"
-    );
-    let restored = fs::read_to_string(&screen_path).unwrap();
-    assert_eq!(restored, original);
+    assert_eq!(payload["data"]["from"], "home");
+    assert_eq!(payload["data"]["to"], "search");
 }
 
 #[test]
-fn undo_errors_outside_git_repo() {
+fn android_serial_env_threads_serial_like_the_flag() {
     let temp = tempfile::tempdir().unwrap();
-    let assertion = minimap(temp.path()).args(["undo"]).assert().failure();
-    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
-    let payload: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(payload["status"], "config_error");
-    assert!(payload["summary"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("not a git repo"));
-}
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script_expect_serial(&bin, &["home", "home", "search"], "emulator-5554");
+    write_adb_script_expect_serial(&bin, "emulator-5554");
 
-#[test]
-fn undo_reports_nothing_to_undo_when_clean() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    init_git_repo_with_baseline(temp.path());
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .env("ANDROID_SERIAL", "emulator-5554")
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
     let output = minimap(temp.path())
-        .args(["undo"])
+        .env("PATH", prepend_path(&bin))
+        .env("ANDROID_SERIAL", "emulator-5554")
+        .args(["tap", "--point", "150,300", "--label", "search"])
         .assert()
         .success()
         .get_output()
@@ -700,792 +1470,350 @@ fn undo_reports_nothing_to_undo_when_clean() {
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["summary"], "nothing to undo");
-    assert_eq!(payload["dropped"], 0);
+    assert_eq!(payload["data"]["to"], "search");
 }
 
 #[test]
-fn validate_screen_current_reports_matched_for_known_screen() {
+fn configured_serial_short_circuits_get_serialno_for_session_cache() {
     let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-if [ "$1" = "layout" ]; then
-  printf '{"class":"Column","children":[{"class":"Button","testTag":"settings","clickable":true}]}'
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args(["validate", "--screen", "current"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["status"], "matched");
-    assert_eq!(
-        payload["current_screen"]["matched_screen"],
-        "screen_settings"
-    );
-}
-
-#[test]
-fn route_define_preserves_commas_in_glob_pattern() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
     minimap(temp.path())
-        .args([
-            "route",
-            "define",
-            "auth-routes",
-            "--to",
-            "screen_settings",
-            "--triggers",
-            "{login,signup}/**",
-        ])
+        .args(["init", "--agents", "codex"])
         .assert()
         .success();
-    let route_path = temp.path().join(".minimap/routes/auth-routes.minimap.json");
-    let route: Value = serde_json::from_str(&fs::read_to_string(&route_path).unwrap()).unwrap();
-    let triggers = route["triggers"].as_array().unwrap();
-    assert_eq!(triggers.len(), 1, "comma inside glob must not split");
-    assert_eq!(triggers[0], "{login,signup}/**");
-}
-
-#[test]
-fn tap_atomic_match_writes_edge_to_existing_screen() {
-    let temp = tempfile::tempdir().unwrap();
-    write_home_to_article_graph(temp.path());
     let bin = fake_bin(temp.path());
-    // android layout is called three times during atomic tap:
-    //   1) pre-tap classification (tap_atomic)
-    //   2) inside tap_selector_result to resolve the selector to bounds
-    //   3) post-tap classification (tap_atomic)
-    // Returns home layout for the first two calls and article-detail for the third.
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
+    write_android_layout_script_expect_serial(&bin, &["home", "home"], "emulator-5554");
+    // This fake's `get-serialno` always exits 1: the session cache can only
+    // work if the configured serial is returned without shelling out.
+    write_adb_script_expect_serial(&bin, "emulator-5554");
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home", "--serial", "emulator-5554"])
+        .assert()
+        .success();
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args([
-            "tap",
-            "--selector",
-            "test_tag=read_article",
-            "--reason",
-            "go to article",
-        ])
+        .args(["whereami", "--serial", "emulator-5554"])
         .assert()
         .success()
         .get_output()
         .stdout
         .clone();
     let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["outcome"], "matched");
-    assert_eq!(payload["from_screen_id"], "screen_home");
-    assert_eq!(payload["to_screen_id"], "screen_article_detail");
-
-    // Screen count is unchanged (2 baseline screens, no new screen).
-    let screen_count = fs::read_dir(temp.path().join(".minimap/graph/screens"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .count();
-    assert_eq!(screen_count, 2);
-
-    // Exactly one new edge file from screen_home → screen_article_detail.
-    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
-        .collect();
-    let new_edges: Vec<&Value> = edges
-        .iter()
-        .filter(|edge| edge["id"] != "edge_home_article")
-        .collect();
-    assert_eq!(new_edges.len(), 1, "atomic tap should write exactly one new edge");
-    assert_eq!(new_edges[0]["from_screen"], "screen_home");
-    assert_eq!(new_edges[0]["to_screen"], "screen_article_detail");
-
-    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
-    assert_eq!(journal.lines().count(), 1);
-    assert!(journal.contains("\"outcome\":\"matched\""));
+    assert_eq!(payload["status"], "known");
+    assert_eq!(payload["place"]["slug"], "home");
+    assert_eq!(payload["cache"]["hit"], true);
+    assert_eq!(payload["metrics"]["layout_calls_total"], 0);
+    // No second Android layout capture happened.
+    let count = fs::read_to_string(bin.join("android-count")).unwrap();
+    assert_eq!(count, "1");
 }
 
 #[test]
-fn tap_atomic_new_screen_writes_screen_and_edge() {
+fn doctor_flags_multiple_devices_without_serial_and_targets_one_with_serial() {
     let temp = tempfile::tempdir().unwrap();
-    // Single-screen fixture: screen_home only.
-    write_json(
-        &temp.path().join(".minimap/graph/screens/screen_home.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_home",
-            "name": "home",
-            "identity_hash": "sha256:not-fast-path",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [
-                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/0", "sibling_bucket": 0, "resource_id": "read_article"}
-                ],
-                "role_distribution": {"Button": 1, "Column": 1},
-                "element_count": 2
-            }
-        }),
-    );
-    let bin = fake_bin(temp.path());
-    // First two layout calls (pre-tap + selector resolve) return home;
-    // third call (post-tap) returns a brand-new layout with no overlap.
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  else
-    printf '{"class":"Dialog","children":[{"class":"Text","text":"Permission denied"},{"class":"Text","text":"Please log in to continue"},{"class":"Button","testTag":"login_button","clickable":true},{"class":"Button","testTag":"cancel_button","clickable":true}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
-    let output = minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args([
-            "tap",
-            "--selector",
-            "test_tag=read_article",
-            "--reason",
-            "discover next screen",
-        ])
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
         .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let payload: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(payload["outcome"], "new_screen");
-    assert_eq!(payload["from_screen_id"], "screen_home");
-    let to_screen_id = payload["to_screen_id"].as_str().unwrap();
-    assert!(to_screen_id.starts_with("screen_"));
-
-    // New screen file appeared.
-    let screens_dir = temp.path().join(".minimap/graph/screens");
-    let screen_count = fs::read_dir(&screens_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .count();
-    assert_eq!(screen_count, 2, "should have original home + new screen");
-    let new_screen_path = screens_dir.join(format!("{to_screen_id}.json"));
-    assert!(new_screen_path.exists(), "new screen JSON should exist");
-
-    // New edge from screen_home to new screen.
-    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
-        .collect();
-    assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0]["from_screen"], "screen_home");
-    assert_eq!(edges[0]["to_screen"], to_screen_id);
-
-    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
-    assert_eq!(journal.lines().count(), 1);
-    assert!(journal.contains("\"outcome\":\"new_screen\""));
-}
-
-#[test]
-fn tap_atomic_drift_stages_proposal_in_repair_band() {
-    let temp = tempfile::tempdir().unwrap();
-    // Screen A: a "hub" with 4 buttons + Column. Designed so a post-tap layout
-    // with 3 of those 4 buttons + 1 different button lands at jaccard ~0.667 on
-    // element keys and 1.0 on role distribution: similarity = 0.75 (drift band).
-    write_json(
-        &temp.path().join(".minimap/graph/screens/screen_hub.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_hub",
-            "name": "hub",
-            "identity_hash": "sha256:not-fast-path",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [
-                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/0", "sibling_bucket": 0, "resource_id": "tile_a"},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/1", "sibling_bucket": 1, "resource_id": "tile_b"},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/2", "sibling_bucket": 2, "resource_id": "tile_c"},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/3", "sibling_bucket": 3, "resource_id": "tile_d"}
-                ],
-                "role_distribution": {"Button": 4, "Column": 1},
-                "element_count": 5
-            }
-        }),
-    );
+        .success();
     let bin = fake_bin(temp.path());
-    // Pre-tap (calls 1 & 2): hub with 4 tiles (exact match to screen_hub).
-    // Post-tap (call 3): hub-like with 3 of the 4 tiles + 1 different tile, same role distribution.
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"tile_a","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}},{"class":"Button","testTag":"tile_b","clickable":true},{"class":"Button","testTag":"tile_c","clickable":true},{"class":"Button","testTag":"tile_d","clickable":true}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"tile_a","clickable":true},{"class":"Button","testTag":"tile_b","clickable":true},{"class":"Button","testTag":"tile_c","clickable":true},{"class":"Button","testTag":"tile_new","clickable":true}]}'
-  fi
-  exit 0
-fi
-exit 2
-"#,
-    );
-    write_executable(
-        &bin.join("adb"),
-        r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
-  exit 0
-fi
-exit 2
-"#,
-    );
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_two_devices(&bin);
+
+    // No serial resolved: two attached devices are a config error with a hint.
     let assertion = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args([
-            "tap",
-            "--selector",
-            "test_tag=tile_a",
-            "--reason",
-            "open tile",
-        ])
+        .args(["doctor"])
         .assert()
-        .code(1);
+        // config_error routes through exit_code_for_status -> 7, matching whereami/go.
+        .code(7);
     let payload: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
-    assert_eq!(payload["outcome"], "drift_staged");
-    assert_eq!(payload["status"], "changed_requires_review");
-    assert_eq!(payload["from_screen_id"], "screen_hub");
-
-    // No new screen, no new edge.
-    let screen_count = fs::read_dir(temp.path().join(".minimap/graph/screens"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .count();
-    assert_eq!(screen_count, 1, "drift must not auto-commit a new screen");
-    let edge_count = fs::read_dir(temp.path().join(".minimap/graph/edges"))
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-                .count()
-        })
-        .unwrap_or(0);
-    assert_eq!(edge_count, 0, "drift must not auto-commit an edge");
-
-    // Proposal with populated changes array.
-    let proposals: Vec<Value> = fs::read_dir(temp.path().join(".minimap/proposals"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
-        .collect();
-    assert_eq!(proposals.len(), 1);
-    assert_eq!(proposals[0]["kind"], "selector_drift");
-    let changes = proposals[0]["changes"].as_array().unwrap();
-    assert!(
-        !changes.is_empty(),
-        "drift proposal must populate `changes` for default accept resolution"
+    assert_eq!(payload["status"], "config_error");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["device_ok"], false);
+    assert_eq!(payload["repo_ok"], true);
+    let device = &payload["checks"]["environment"][2];
+    assert_eq!(device["name"], "device");
+    assert_eq!(device["status"], "fail");
+    assert_eq!(
+        device["hint"],
+        "multiple devices attached; pass --serial or set ANDROID_SERIAL"
     );
 
-    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
-    assert!(journal.contains("\"outcome\":\"drift_staged\""));
+    // Targeting one device by serial restores a healthy doctor.
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor", "--serial", "emulator-5554"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["device_ok"], true);
+    let device = &payload["checks"]["environment"][2];
+    assert_eq!(device["status"], "pass");
+    assert_eq!(device["serial"], "emulator-5554");
+    assert!(device.get("hint").is_none());
 }
 
-#[test]
-fn tap_atomic_journal_carries_viewport_when_wm_size_seeded() {
-    let temp = tempfile::tempdir().unwrap();
-    write_home_to_article_graph(temp.path());
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
+fn minimap(cwd: &Path) -> Command {
+    let mut command = Command::cargo_bin("minimap").unwrap();
+    command.current_dir(cwd);
+    command.env("MINIMAP_ACTION_SETTLE_MS", "0");
+    // Keep an ambient ANDROID_SERIAL on the host from leaking into tests that
+    // exercise the serial-less default behavior.
+    command.env_remove("ANDROID_SERIAL");
+    command
+}
+
+fn fake_bin(root: &Path) -> PathBuf {
+    let bin = root.join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    bin
+}
+
+fn prepend_path(bin: &Path) -> String {
+    let old = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{old}", bin.display())
+}
+
+fn write_android_layout_script(bin: &Path, sequence: &[&str]) {
+    write_android_layout_script_with_guard(bin, sequence, "");
+}
+
+/// Fake `android` that exits 1 unless `layout` invocations carry
+/// `--device=<serial>`, proving the configured serial reaches the layout CLI.
+fn write_android_layout_script_expect_serial(bin: &Path, sequence: &[&str], serial: &str) {
+    let guard = format!(
+        r#"if [ "$1" = "layout" ]; then
+  FOUND=no
+  for ARG in "$@"; do
+    if [ "$ARG" = "--device={serial}" ]; then FOUND=yes; fi
+  done
+  if [ "$FOUND" != "yes" ]; then
+    echo "expected --device={serial} on android layout, got: $*" >&2
+    exit 1
+  fi
+fi
+"#
+    );
+    write_android_layout_script_with_guard(bin, sequence, &guard);
+}
+
+fn write_android_layout_script_with_guard(bin: &Path, sequence: &[&str], guard: &str) {
+    let sequence = sequence.join(" ");
+    let body = format!(
         r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
+{guard}COUNT_FILE="$(dirname "$0")/android-count"
 COUNT=0
 if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
 COUNT=$((COUNT + 1))
 printf "%s" "$COUNT" > "$COUNT_FILE"
+ITEM="$(printf '{sequence}' | cut -d ' ' -f "$COUNT")"
+if [ -z "$ITEM" ]; then ITEM="$(printf '{sequence}' | awk '{{print $NF}}')"; fi
 if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
-  fi
+  case "$ITEM" in
+    home)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Button","text":"SEARCH","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}}]}}'
+      ;;
+    search)
+      printf '{{"class":"Column","children":[{{"class":"Button","text":"HOME","bounds":{{"left":10,"top":20,"right":100,"bottom":120}}}},{{"class":"Text","text":"Categories"}},{{"class":"Text","text":"Lifestyles"}}]}}'
+      ;;
+    home_geo)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Button","text":"SEARCH","center":"[540,2200]","bounds":"[480,2100][600,2300]"}}]}}'
+      ;;
+    search_geo)
+      printf '{{"class":"Column","children":[{{"class":"Button","text":"HOME","center":"[100,8000]","bounds":"[0,7900][200,8100]"}},{{"class":"Text","text":"Categories"}},{{"class":"Text","text":"Lifestyles"}}]}}'
+      ;;
+    home_changed)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Text","text":"SEARCH"}},{{"class":"Text","text":"Featured today"}}]}}'
+      ;;
+    settings)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"Settings"}},{{"class":"Text","text":"Account"}},{{"class":"Text","text":"Notifications"}}]}}'
+      ;;
+    permission)
+      printf '{{"class":"FrameLayout","children":[{{"class":"Button","resource-id":"com.android.permissioncontroller:id/permission_allow_button","text":"Allow"}},{{"class":"Button","resource-id":"com.android.permissioncontroller:id/permission_deny_button","text":"Deny"}}]}}'
+      ;;
+    alpha)
+      printf '{{"class":"Column","children":[{{"class":"Button","testTag":"alpha_btn","text":"Alpha","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}},{{"class":"Text","text":"Welcome"}},{{"class":"Text","text":"Status"}}]}}'
+      ;;
+    alpha_drift)
+      printf '{{"class":"Column","children":[{{"class":"Button","testTag":"alpha_btn","text":"Alpha","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}},{{"class":"Text","text":"Welcome"}},{{"class":"Text","text":"Status updated"}}]}}'
+      ;;
+    beta)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"Beta page"}},{{"class":"Text","text":"Detail"}}]}}'
+      ;;
+    nav)
+      printf '{{"class":"Column","children":[{{"class":"Button","testTag":"s1"}},{{"class":"Button","testTag":"s2"}},{{"class":"Button","testTag":"s3"}},{{"class":"Button","testTag":"s4"}},{{"class":"Button","testTag":"s5"}},{{"class":"Button","testTag":"go_search","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}},{{"class":"Text","text":"Nav"}}]}}'
+      ;;
+    nav_drift)
+      printf '{{"class":"Column","children":[{{"class":"Button","testTag":"s1"}},{{"class":"Button","testTag":"s2"}},{{"class":"Button","testTag":"s3"}},{{"class":"Button","testTag":"s4"}},{{"class":"Button","testTag":"s5"}},{{"class":"Text","text":"Nav"}}]}}'
+      ;;
+    other)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"Other page"}},{{"class":"Text","text":"Body"}}]}}'
+      ;;
+    blank)
+      printf '[]'
+      ;;
+    email)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"alice@example.com"}}]}}'
+      ;;
+    *)
+      printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Button","text":"SEARCH","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}}]}}'
+      ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "screen" ] && [ "$2" = "capture" ]; then
+  exit 0
+fi
+if [ "$1" = "screen" ] && [ "$2" = "resolve" ]; then
+  printf 'input tap 200 300'
+  exit 0
+fi
+exit 2
+"#
+    );
+    write_executable(&bin.join("android"), &body);
+}
+
+fn write_adb_script(bin: &Path) {
+    write_adb_script_with_size(bin, "1080x2400");
+}
+
+/// Fake `adb` whose `wm size` reports a caller-chosen viewport. Used to record a
+/// geometry edge at one viewport and replay it at another (see the viewport
+/// mismatch test).
+fn write_adb_script_with_size(bin: &Path, size: &str) {
+    let body = format!(
+        r#"#!/bin/sh
+if [ "$1" = "get-state" ]; then
+  printf 'device\n'
+  exit 0
+fi
+if [ "$1" = "get-serialno" ]; then
+  printf 'fake-serial\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
+  printf 'Physical size: {size}\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "input" ]; then
+  exit 0
+fi
+exit 2
+"#
+    );
+    write_executable(&bin.join("adb"), &body);
+}
+
+/// Fake `adb` that cannot report a display size (so `display_size()` fails). Taps
+/// still succeed; only `wm size` is unavailable. Used to exercise the geometry
+/// tap `environment_error` path.
+fn write_adb_script_no_display(bin: &Path) {
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "get-state" ]; then
+  printf 'device\n'
+  exit 0
+fi
+if [ "$1" = "get-serialno" ]; then
+  printf 'fake-serial\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
+  printf 'wm size unavailable\n'
+  exit 1
+fi
+if [ "$1" = "shell" ] && [ "$2" = "input" ]; then
   exit 0
 fi
 exit 2
 "#,
     );
-    write_executable(
-        &bin.join("adb"),
+}
+
+/// Fake `adb` that exits 1 unless every invocation starts with `-s <serial>`,
+/// proving the serial is threaded into each adb call. `get-serialno` always
+/// fails so a configured serial must short-circuit it (cache paths included).
+fn write_adb_script_expect_serial(bin: &Path, serial: &str) {
+    let body = format!(
         r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+if [ "$1" != "-s" ] || [ "$2" != "{serial}" ]; then
+  echo "expected -s {serial}, got: $*" >&2
+  exit 1
+fi
+shift 2
+if [ "$1" = "get-state" ]; then
+  printf 'device\n'
   exit 0
+fi
+if [ "$1" = "get-serialno" ]; then
+  echo "get-serialno must never run when a serial is configured" >&2
+  exit 1
 fi
 if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
   printf 'Physical size: 1080x2400\n'
   exit 0
 fi
-exit 2
-"#,
-    );
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args([
-            "tap",
-            "--selector",
-            "test_tag=read_article",
-            "--reason",
-            "go to article",
-        ])
-        .assert()
-        .success();
-    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
-    let entry: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
-    assert_eq!(entry["outcome"], "matched");
-    assert_eq!(entry["viewport"], json!({"width": 1080, "height": 2400}));
-}
-
-#[test]
-fn tap_atomic_journal_omits_viewport_when_wm_size_fails() {
-    let temp = tempfile::tempdir().unwrap();
-    write_home_to_article_graph(temp.path());
-    let bin = fake_bin(temp.path());
-    write_executable(
-        &bin.join("android"),
-        r#"#!/bin/sh
-COUNT_FILE="$(dirname "$0")/android-count"
-COUNT=0
-if [ -f "$COUNT_FILE" ]; then COUNT=$(cat "$COUNT_FILE"); fi
-COUNT=$((COUNT + 1))
-printf "%s" "$COUNT" > "$COUNT_FILE"
-if [ "$1" = "layout" ]; then
-  if [ "$COUNT" = "1" ] || [ "$COUNT" = "2" ]; then
-    printf '{"class":"Column","children":[{"class":"Button","testTag":"read_article","clickable":true,"bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}'
-  else
-    printf '{"class":"Column","children":[{"class":"Text","text":"Article body"}]}'
-  fi
+if [ "$1" = "shell" ] && [ "$2" = "input" ]; then
   exit 0
 fi
 exit 2
-"#,
+"#
     );
-    // Tap succeeds, but `wm size` is deliberately unsupported (falls through to exit 2).
+    write_executable(&bin.join("adb"), &body);
+}
+
+/// Fake `adb` with two attached devices: bare `get-state` fails the way real
+/// adb does with multiple devices, while `-s emulator-5554 get-state` succeeds.
+fn write_adb_script_two_devices(bin: &Path) {
     write_executable(
         &bin.join("adb"),
         r#"#!/bin/sh
-if [ "$1" = "shell" ] && [ "$2" = "input" ] && [ "$3" = "tap" ]; then
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n'
+  exit 0
+fi
+if [ "$1" = "-s" ] && [ "$2" = "emulator-5554" ] && [ "$3" = "get-state" ]; then
+  printf 'device\n'
+  exit 0
+fi
+if [ "$1" = "get-state" ]; then
+  echo 'adb: more than one device/emulator' >&2
+  exit 1
+fi
+exit 2
+"#,
+    );
+}
+
+/// Fake `adb` whose device is not in the `device` state (e.g. unauthorized).
+/// Used to drive the unhealthy `doctor` path.
+fn write_adb_script_offline(bin: &Path) {
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "get-state" ]; then
+  printf 'unauthorized\n'
+  exit 1
+fi
+if [ "$1" = "get-serialno" ]; then
+  printf 'fake-serial\n'
   exit 0
 fi
 exit 2
 "#,
     );
-    minimap(temp.path())
-        .env("PATH", prepend_path(&bin))
-        .args([
-            "tap",
-            "--selector",
-            "test_tag=read_article",
-            "--reason",
-            "go to article",
-        ])
-        .assert()
-        .success();
-    let journal = fs::read_to_string(temp.path().join(".minimap/journal.jsonl")).unwrap();
-    let entry: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
-    assert_eq!(entry["outcome"], "matched");
-    assert!(
-        entry.get("viewport").is_none() || entry["viewport"].is_null(),
-        "viewport should be absent when wm size fails: {entry}"
-    );
 }
 
-#[test]
-fn drift_proposal_default_accept_writes_edge_to_candidate() {
-    let temp = tempfile::tempdir().unwrap();
-    // Existing screen in the graph that the drift proposal points at as candidate.
-    write_settings_screen(temp.path());
-    // A throwaway source screen file just so the source id is "real" on disk.
-    write_json(
-        &temp.path().join(".minimap/graph/screens/screen_dummy_src.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_dummy_src",
-            "name": "dummy",
-            "identity_hash": "sha256:dummy-src",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [],
-                "role_distribution": {},
-                "element_count": 0
-            }
-        }),
-    );
-    let edge = json!({
-        "schema_version": "minimap.edge.v1",
-        "id": "edge_dummy_src__screen_settings__abcd1234",
-        "from_screen": "screen_dummy_src",
-        "to_screen": "screen_settings",
-        "intent": "drift candidate edge",
-        "action": {
-            "kind": "tap",
-            "description": "drift candidate edge",
-            "selector_candidates": [
-                {"kind": "resource_id", "value": "settings_tile", "score": 0.7}
-            ]
-        },
-        "expectations": [{"kind": "screen_reached", "screen": "screen_settings"}],
-        "learned_from": {"source": "atomic_tap"}
-    });
-    let proposal = json!({
-        "schema_version": "minimap.proposal.v1",
-        "id": "proposal-drift-abcd1234",
-        "kind": "selector_drift",
-        "reason": "fixture",
-        "candidate_screen_id": "screen_settings",
-        "from_screen_id": "screen_dummy_src",
-        "match_confidence": 0.7,
-        "identity_hash": "sha256:abcd1234deadbeef",
-        "observed_layout": {"class":"Column"},
-        "observed_normalized": {"elements": [], "role_distribution": {}, "element_count": 0},
-        "selector_candidates": [{"kind": "resource_id", "value": "settings_tile", "score": 0.7}],
-        "tap_reason": "go to settings",
-        "changes": [{"op": "add", "object": edge}]
-    });
-    write_json(
-        &temp.path().join(".minimap/proposals/proposal-drift-abcd1234.json"),
-        &proposal,
-    );
-
-    minimap(temp.path())
-        .args(["accept", "proposal-drift-abcd1234"])
-        .assert()
-        .success();
-
-    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
-        .collect();
-    assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0]["from_screen"], "screen_dummy_src");
-    assert_eq!(edges[0]["to_screen"], "screen_settings");
-
-    // No new screen — default accept does NOT materialize a new screen.
-    let screen_count = fs::read_dir(temp.path().join(".minimap/graph/screens"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .count();
-    assert_eq!(screen_count, 2, "default accept should not add a new screen");
-}
-
-#[test]
-fn drift_proposal_as_new_creates_screen_and_edge() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    write_json(
-        &temp.path().join(".minimap/graph/screens/screen_dummy_src.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_dummy_src",
-            "name": "dummy",
-            "identity_hash": "sha256:dummy-src",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [],
-                "role_distribution": {},
-                "element_count": 0
-            }
-        }),
-    );
-    let proposal_identity_hash = "sha256:deadbeefcafef00d";
-    let proposal = json!({
-        "schema_version": "minimap.proposal.v1",
-        "id": "proposal-drift-deadbeef",
-        "kind": "selector_drift",
-        "reason": "fixture",
-        "candidate_screen_id": "screen_settings",
-        "from_screen_id": "screen_dummy_src",
-        "match_confidence": 0.7,
-        "identity_hash": proposal_identity_hash,
-        "observed_layout": {"class":"Column","children":[{"class":"Text","text":"New Section Header"}]},
-        "observed_normalized": {
-            "schema_version": "minimap.normalized_layout.v1",
-            "elements": [
-                {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                {"role": "Text", "clickable": false, "enabled": true, "path": "0/0", "sibling_bucket": 0, "text_class": "medium"}
-            ],
-            "role_distribution": {"Column": 1, "Text": 1},
-            "element_count": 2
-        },
-        "selector_candidates": [{"kind": "resource_id", "value": "settings_tile", "score": 0.7}],
-        "tap_reason": "go to new section",
-        "changes": []
-    });
-    write_json(
-        &temp.path().join(".minimap/proposals/proposal-drift-deadbeef.json"),
-        &proposal,
-    );
-
-    minimap(temp.path())
-        .args(["accept", "proposal-drift-deadbeef", "--as-new"])
-        .assert()
-        .success();
-
-    // Expected new screen id derived from the proposal's identity_hash: screen_<first8 hex>.
-    let expected_screen_id = "screen_deadbeef";
-    let new_screen_path = temp
-        .path()
-        .join(".minimap/graph/screens")
-        .join(format!("{expected_screen_id}.json"));
-    assert!(
-        new_screen_path.exists(),
-        "accept --as-new should write {} (got: {:?})",
-        new_screen_path.display(),
-        fs::read_dir(temp.path().join(".minimap/graph/screens"))
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name())
-            .collect::<Vec<_>>()
-    );
-
-    let edges: Vec<Value> = fs::read_dir(temp.path().join(".minimap/graph/edges"))
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
-        .collect();
-    assert_eq!(edges.len(), 1);
-    assert_eq!(edges[0]["from_screen"], "screen_dummy_src");
-    assert_eq!(edges[0]["to_screen"], expected_screen_id);
-}
-
-#[test]
-fn accept_as_new_errors_on_non_drift_proposal() {
-    let temp = tempfile::tempdir().unwrap();
-    write_settings_screen(temp.path());
-    let proposal = json!({
-        "schema_version": "minimap.proposal.v1",
-        "id": "proposal-route-foo",
-        "kind": "learned_route",
-        "reason": "fixture",
-        "changes": []
-    });
-    write_json(
-        &temp.path().join(".minimap/proposals/proposal-route-foo.json"),
-        &proposal,
-    );
-
-    let assertion = minimap(temp.path())
-        .args(["accept", "proposal-route-foo", "--as-new"])
-        .assert()
-        .failure();
-    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).to_string();
-    let payload: Value = serde_json::from_str(&stdout).unwrap();
-    let summary = payload["summary"]
-        .as_str()
-        .or_else(|| payload["data"]["error"]["message"].as_str())
-        .unwrap_or_default();
-    assert!(
-        summary.contains("selector_drift") && summary.contains("learned_route"),
-        "error should name both the required and actual proposal kind: {summary}"
-    );
-}
-
-fn minimap(dir: &Path) -> Command {
-    let mut command = Command::cargo_bin("minimap").unwrap();
-    command.current_dir(dir);
-    command
-}
-
-fn init_git_repo_with_baseline(dir: &Path) {
-    fn git(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
-            .expect("git available");
-        assert!(
-            status.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&status.stderr)
-        );
-    }
-    git(dir, &["init", "--quiet", "--initial-branch=main"]);
-    git(dir, &["add", "."]);
-    git(dir, &["commit", "--quiet", "-m", "baseline"]);
-}
-
-fn write_json(path: &Path, value: &Value) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
-}
-
-fn read_json_path(path: &Path) -> Value {
-    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
-}
-
-fn write_settings_screen(root: &Path) {
-    write_json(
-        &root.join(".minimap/graph/screens/screen_settings.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_settings",
-            "name": "settings",
-            "identity_hash": "sha256:not-fast-path",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [
-                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/0", "sibling_bucket": 0, "resource_id": "settings"}
-                ],
-                "role_distribution": {"Button": 1, "Column": 1},
-                "element_count": 2
-            }
-        }),
-    );
-}
-
-fn write_home_to_article_graph(root: &Path) {
-    write_json(
-        &root.join(".minimap/graph/screens/screen_home.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_home",
-            "name": "home",
-            "identity_hash": "sha256:not-fast-path",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [
-                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                    {"role": "Button", "clickable": true, "enabled": true, "path": "0/0", "sibling_bucket": 0, "resource_id": "read_article"}
-                ],
-                "role_distribution": {"Button": 1, "Column": 1},
-                "element_count": 2
-            }
-        }),
-    );
-    write_json(
-        &root.join(".minimap/graph/screens/screen_article_detail.json"),
-        &json!({
-            "schema_version": "minimap.screen.v1",
-            "id": "screen_article_detail",
-            "name": "article-detail",
-            "identity_hash": "sha256:not-fast-path",
-            "normalized": {
-                "schema_version": "minimap.normalized_layout.v1",
-                "elements": [
-                    {"role": "Column", "clickable": false, "enabled": true, "path": "0", "sibling_bucket": 0},
-                    {"role": "Text", "clickable": false, "enabled": true, "path": "0/0", "sibling_bucket": 0, "text_class": "medium"}
-                ],
-                "role_distribution": {"Column": 1, "Text": 1},
-                "element_count": 2
-            }
-        }),
-    );
-    write_json(
-        &root.join(".minimap/graph/edges/edge_home_article.json"),
-        &json!({
-            "schema_version": "minimap.edge.v1",
-            "id": "edge_home_article",
-            "from_screen": "screen_home",
-            "to_screen": "screen_article_detail",
-            "action": {
-                "kind": "tap",
-                "selector_candidates": [
-                    {"kind": "test_tag", "value": "read_article", "score": 0.92}
-                ]
-            }
-        }),
-    );
-    write_json(
-        &root.join(".minimap/routes/read-article.minimap.json"),
-        &json!({
-            "schema_version": "minimap.route.v1",
-            "name": "read-article",
-            "from": {"screen": "screen_home"},
-            "target": {"screen": "screen_article_detail"}
-        }),
-    );
-}
-
-fn fake_bin(root: &Path) -> PathBuf {
-    let bin = root.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    bin
-}
-
-fn write_executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1495,7 +1823,51 @@ fn write_executable(path: &Path, content: &str) {
     }
 }
 
-fn prepend_path(bin: &Path) -> String {
-    let current = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{current}", bin.display())
+fn read_json_path(path: &Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn edge_files(root: &Path) -> Vec<PathBuf> {
+    json_files_in(&root.join(".minimap/graph/edges"))
+}
+
+fn edge_count(root: &Path) -> usize {
+    edge_files(root).len()
+}
+
+fn place_count(root: &Path) -> usize {
+    json_files_in(&root.join(".minimap/graph/places")).len()
+}
+
+fn json_files_in(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect()
+}
+
+/// Recursively collect any files under `dir` whose name contains `needle`.
+fn find_files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(find_files_containing(&path, needle));
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.contains(needle))
+            .unwrap_or(false)
+        {
+            found.push(path);
+        }
+    }
+    found
 }

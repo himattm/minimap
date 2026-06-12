@@ -15,16 +15,21 @@ pub struct CommandResult {
 }
 
 pub trait CommandRunner {
-    fn run(&mut self, args: &[String]) -> Result<CommandResult>;
+    fn run(&mut self, args: &[String], env: &[(String, String)]) -> Result<CommandResult>;
 }
 
 #[derive(Default)]
 pub struct SubprocessRunner;
 
 impl CommandRunner for SubprocessRunner {
-    fn run(&mut self, args: &[String]) -> Result<CommandResult> {
+    fn run(&mut self, args: &[String], env: &[(String, String)]) -> Result<CommandResult> {
         let (program, rest) = args.split_first().context("empty command")?;
-        let output = Command::new(program).args(rest).output().with_context(|| {
+        let mut command = Command::new(program);
+        command.args(rest);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let output = command.output().with_context(|| {
             format!(
                 "failed to execute {}",
                 args.first().cloned().unwrap_or_default()
@@ -70,14 +75,26 @@ pub fn parse_input_tap(output: &str) -> Result<TapPoint> {
 pub struct AndroidCli<R> {
     runner: R,
     android_bin: String,
+    serial: Option<String>,
 }
 
 impl<R: CommandRunner> AndroidCli<R> {
-    pub fn new(runner: R) -> Self {
+    pub fn new(runner: R, serial: Option<String>) -> Self {
         Self {
             runner,
             android_bin: "android".to_string(),
+            serial,
         }
+    }
+
+    /// `android screen capture`/`resolve` have no device flag; they inherit
+    /// device selection from adb, so target the device by setting
+    /// ANDROID_SERIAL on the spawned process instead.
+    fn serial_env(&self) -> Vec<(String, String)> {
+        self.serial
+            .iter()
+            .map(|serial| ("ANDROID_SERIAL".to_string(), serial.clone()))
+            .collect()
     }
 
     pub fn layout(&mut self, diff: bool) -> Result<CommandResult> {
@@ -85,7 +102,10 @@ impl<R: CommandRunner> AndroidCli<R> {
         if diff {
             args.push("--diff".to_string());
         }
-        run_checked(&mut self.runner, args)
+        if let Some(serial) = &self.serial {
+            args.push(format!("--device={serial}"));
+        }
+        run_checked(&mut self.runner, args, &[])
     }
 
     pub fn screen_capture(&mut self, output: &str, annotate: bool) -> Result<CommandResult> {
@@ -98,10 +118,12 @@ impl<R: CommandRunner> AndroidCli<R> {
             args.push("--annotate".to_string());
         }
         args.push(format!("--output={output}"));
-        run_checked(&mut self.runner, args)
+        let env = self.serial_env();
+        run_checked(&mut self.runner, args, &env)
     }
 
     pub fn screen_resolve(&mut self, screenshot: &str, string: &str) -> Result<CommandResult> {
+        let env = self.serial_env();
         run_checked(
             &mut self.runner,
             vec![
@@ -111,6 +133,7 @@ impl<R: CommandRunner> AndroidCli<R> {
                 format!("--screenshot={screenshot}"),
                 format!("--string={string}"),
             ],
+            &env,
         )
     }
 }
@@ -118,40 +141,90 @@ impl<R: CommandRunner> AndroidCli<R> {
 pub struct Adb<R> {
     runner: R,
     adb_bin: String,
+    serial: Option<String>,
 }
 
 impl<R: CommandRunner> Adb<R> {
-    pub fn new(runner: R) -> Self {
+    pub fn new(runner: R, serial: Option<String>) -> Self {
         Self {
             runner,
             adb_bin: "adb".to_string(),
+            serial,
         }
     }
 
+    /// The adb invocation prefix: the binary plus `-s <serial>` when a serial
+    /// is configured, so every command targets one device.
+    fn base_args(&self) -> Vec<String> {
+        let mut args = vec![self.adb_bin.clone()];
+        if let Some(serial) = &self.serial {
+            args.push("-s".to_string());
+            args.push(serial.clone());
+        }
+        args
+    }
+
     pub fn tap(&mut self, point: TapPoint) -> Result<CommandResult> {
-        run_checked(
-            &mut self.runner,
-            vec![
-                self.adb_bin.clone(),
-                "shell".to_string(),
-                "input".to_string(),
-                "tap".to_string(),
-                point.x.to_string(),
-                point.y.to_string(),
-            ],
-        )
+        let mut args = self.base_args();
+        args.extend([
+            "shell".to_string(),
+            "input".to_string(),
+            "tap".to_string(),
+            point.x.to_string(),
+            point.y.to_string(),
+        ]);
+        run_checked(&mut self.runner, args, &[])
+    }
+
+    pub fn back(&mut self) -> Result<CommandResult> {
+        let mut args = self.base_args();
+        args.extend([
+            "shell".to_string(),
+            "input".to_string(),
+            "keyevent".to_string(),
+            "KEYCODE_BACK".to_string(),
+        ]);
+        run_checked(&mut self.runner, args, &[])
+    }
+
+    pub fn swipe(
+        &mut self,
+        start_x: i64,
+        start_y: i64,
+        end_x: i64,
+        end_y: i64,
+        duration_ms: i64,
+    ) -> Result<CommandResult> {
+        let mut args = self.base_args();
+        args.extend([
+            "shell".to_string(),
+            "input".to_string(),
+            "swipe".to_string(),
+            start_x.to_string(),
+            start_y.to_string(),
+            end_x.to_string(),
+            end_y.to_string(),
+            duration_ms.to_string(),
+        ]);
+        run_checked(&mut self.runner, args, &[])
+    }
+
+    pub fn serial(&mut self) -> Result<String> {
+        // An explicitly configured serial is authoritative; `adb get-serialno`
+        // would fail outright with more than one device attached.
+        if let Some(serial) = &self.serial {
+            return Ok(serial.clone());
+        }
+        let mut args = self.base_args();
+        args.push("get-serialno".to_string());
+        let result = run_checked(&mut self.runner, args, &[])?;
+        Ok(result.stdout.trim().to_string())
     }
 
     pub fn display_size(&mut self) -> Result<Viewport> {
-        let result = run_checked(
-            &mut self.runner,
-            vec![
-                self.adb_bin.clone(),
-                "shell".to_string(),
-                "wm".to_string(),
-                "size".to_string(),
-            ],
-        )?;
+        let mut args = self.base_args();
+        args.extend(["shell".to_string(), "wm".to_string(), "size".to_string()]);
+        let result = run_checked(&mut self.runner, args, &[])?;
         parse_wm_size(&result.stdout)
     }
 }
@@ -182,8 +255,12 @@ fn parse_size_value(value: &str) -> Option<Viewport> {
     Some(Viewport { width, height })
 }
 
-fn run_checked<R: CommandRunner>(runner: &mut R, args: Vec<String>) -> Result<CommandResult> {
-    let result = runner.run(&args)?;
+fn run_checked<R: CommandRunner>(
+    runner: &mut R,
+    args: Vec<String>,
+    env: &[(String, String)],
+) -> Result<CommandResult> {
+    let result = runner.run(&args, env)?;
     if result.status != 0 {
         bail!(
             "command failed: {} (status {}, stderr: {})",
@@ -327,16 +404,22 @@ pub fn resolve_selector_point(layout: &Value, selector: &str) -> Result<TapPoint
     let (key, expected) = selector
         .split_once('=')
         .context("selectors must use key=value syntax")?;
-    let key = match key.trim() {
-        "content_desc" | "content_description" | "desc" => "contentDescription",
-        "id" | "resource_id" => "resourceId",
-        "test_tag" => "testTag",
-        other => other,
+    // `android layout` emits hyphenated keys (content-desc, resource-id); legacy
+    // UIAutomator dumps use camelCase. Try both so we don't break either shape.
+    let candidates: Vec<&str> = match key.trim() {
+        "content_desc" | "content_description" | "desc" => {
+            vec!["content-desc", "contentDescription"]
+        }
+        "id" | "resource_id" => vec!["resource-id", "resourceId"],
+        "test_tag" => vec!["testTag", "test-tag"],
+        other => vec![other],
     };
     let expected = expected.trim();
     for node in walk_nodes(layout) {
-        if node.get(key).and_then(Value::as_str) == Some(expected) {
-            return center_of(node).context("matched node has no tap bounds");
+        for k in &candidates {
+            if node.get(*k).and_then(Value::as_str) == Some(expected) {
+                return center_of(node).context("matched node has no tap bounds");
+            }
         }
     }
     bail!("Selector not found: {selector}")
@@ -362,6 +445,16 @@ fn walk_nodes(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
 }
 
 fn center_of(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
+    if let Some(point) = bounds_center(node) {
+        return Some(point);
+    }
+    // Real `android layout` output exposes precomputed center as a "[x,y]" string.
+    node.get("center")
+        .and_then(Value::as_str)
+        .and_then(parse_center_string)
+}
+
+fn bounds_center(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
     match node.get("bounds")? {
         Value::Object(bounds) => {
             let left = number(bounds, &["left", "x", "minX"])?;
@@ -393,6 +486,15 @@ fn center_of(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
     }
 }
 
+fn parse_center_string(s: &str) -> Option<TapPoint> {
+    let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let (x, y) = inner.split_once(',')?;
+    Some(TapPoint {
+        x: x.trim().parse().ok()?,
+        y: y.trim().parse().ok()?,
+    })
+}
+
 fn number(map: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<f64> {
     keys.iter()
         .find_map(|key| map.get(*key).and_then(Value::as_f64))
@@ -418,6 +520,7 @@ mod tests {
     struct FakeRunner {
         outputs: Vec<CommandResult>,
         calls: Vec<Vec<String>>,
+        envs: Vec<Vec<(String, String)>>,
     }
 
     impl FakeRunner {
@@ -425,14 +528,24 @@ mod tests {
             Self {
                 outputs,
                 calls: vec![],
+                envs: vec![],
             }
         }
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&mut self, args: &[String]) -> Result<CommandResult> {
+        fn run(&mut self, args: &[String], env: &[(String, String)]) -> Result<CommandResult> {
             self.calls.push(args.to_vec());
+            self.envs.push(env.to_vec());
             Ok(self.outputs.remove(0))
+        }
+    }
+
+    // Lets a test lend the runner to a wrapper and still inspect the recorded
+    // calls afterwards.
+    impl CommandRunner for &mut FakeRunner {
+        fn run(&mut self, args: &[String], env: &[(String, String)]) -> Result<CommandResult> {
+            (**self).run(args, env)
         }
     }
 
@@ -459,8 +572,10 @@ mod tests {
 
     #[test]
     fn layout_diff_uses_android_in_session_scope() {
-        let mut android =
-            AndroidCli::new(FakeRunner::new(vec![ok(&["android"], r#"{"changed":[]}"#)]));
+        let mut android = AndroidCli::new(
+            FakeRunner::new(vec![ok(&["android"], r#"{"changed":[]}"#)]),
+            None,
+        );
         let result = layout_result(&mut android, true).unwrap();
         assert_eq!(result["kind"], "android_layout_diff");
         assert_eq!(result["diff_scope"], "android_in_session");
@@ -469,11 +584,14 @@ mod tests {
     #[test]
     fn tap_selector_resolves_bounds_and_taps() {
         let layout = r#"{"children":[{"text":"Settings","bounds":{"left":100,"top":200,"right":300,"bottom":400}}]}"#;
-        let mut android = AndroidCli::new(FakeRunner::new(vec![ok(&["android"], layout)]));
-        let mut adb = Adb::new(FakeRunner::new(vec![
-            ok(&["adb"], ""),
-            ok(&["adb"], "Physical size: 1080x2400\n"),
-        ]));
+        let mut android = AndroidCli::new(FakeRunner::new(vec![ok(&["android"], layout)]), None);
+        let mut adb = Adb::new(
+            FakeRunner::new(vec![
+                ok(&["adb"], ""),
+                ok(&["adb"], "Physical size: 1080x2400\n"),
+            ]),
+            None,
+        );
         let result = tap_selector_result(
             &mut android,
             &mut adb,
@@ -486,6 +604,43 @@ mod tests {
             result["action"]["viewport"],
             json!({"width": 1080, "height": 2400})
         );
+    }
+
+    #[test]
+    fn tap_selector_resolves_real_cli_shape() {
+        // Mirrors what `android layout` actually emits: flat array of nodes
+        // with hyphenated keys and a stringified center.
+        let layout = r#"[{"content-desc":"Settings","center":"[1006,147]","key":1},{"text":"Commute","center":"[585,659]","key":2}]"#;
+        let mut android = AndroidCli::new(FakeRunner::new(vec![ok(&["android"], layout)]), None);
+        let mut adb = Adb::new(
+            FakeRunner::new(vec![
+                ok(&["adb"], ""),
+                ok(&["adb"], "Physical size: 1080x2400\n"),
+            ]),
+            None,
+        );
+        let result = tap_selector_result(
+            &mut android,
+            &mut adb,
+            "content_desc=Settings",
+            Some("open settings"),
+        )
+        .unwrap();
+        assert_eq!(result["action"]["point"], json!({"x": 1006, "y": 147}));
+    }
+
+    #[test]
+    fn parse_center_string_parses_bracketed_pair() {
+        assert_eq!(
+            parse_center_string("[1006,147]").unwrap(),
+            TapPoint { x: 1006, y: 147 }
+        );
+        assert_eq!(
+            parse_center_string(" [ 12 , 34 ] ").unwrap(),
+            TapPoint { x: 12, y: 34 }
+        );
+        assert!(parse_center_string("1006,147").is_none());
+        assert!(parse_center_string("[abc,def]").is_none());
     }
 
     #[test]
@@ -520,10 +675,10 @@ mod tests {
 
     #[test]
     fn adb_display_size_returns_viewport_from_runner() {
-        let mut adb = Adb::new(FakeRunner::new(vec![ok(
-            &["adb"],
-            "Physical size: 1080x2400\n",
-        )]));
+        let mut adb = Adb::new(
+            FakeRunner::new(vec![ok(&["adb"], "Physical size: 1080x2400\n")]),
+            None,
+        );
         let viewport = adb.display_size().unwrap();
         assert_eq!(
             viewport,
@@ -532,5 +687,156 @@ mod tests {
                 height: 2400
             }
         );
+    }
+
+    #[test]
+    fn adb_inserts_serial_before_every_subcommand() {
+        let mut runner = FakeRunner::new(vec![
+            ok(&["adb"], ""),
+            ok(&["adb"], ""),
+            ok(&["adb"], ""),
+            ok(&["adb"], "Physical size: 1080x2400\n"),
+        ]);
+        {
+            let mut adb = Adb::new(&mut runner, Some("emulator-5554".to_string()));
+            adb.tap(TapPoint { x: 5, y: 6 }).unwrap();
+            adb.back().unwrap();
+            adb.swipe(1, 2, 3, 4, 350).unwrap();
+            adb.display_size().unwrap();
+        }
+        assert_eq!(
+            runner.calls[0],
+            vec![
+                "adb",
+                "-s",
+                "emulator-5554",
+                "shell",
+                "input",
+                "tap",
+                "5",
+                "6"
+            ]
+        );
+        assert_eq!(
+            runner.calls[1],
+            vec![
+                "adb",
+                "-s",
+                "emulator-5554",
+                "shell",
+                "input",
+                "keyevent",
+                "KEYCODE_BACK"
+            ]
+        );
+        assert_eq!(
+            runner.calls[2],
+            vec![
+                "adb",
+                "-s",
+                "emulator-5554",
+                "shell",
+                "input",
+                "swipe",
+                "1",
+                "2",
+                "3",
+                "4",
+                "350"
+            ]
+        );
+        assert_eq!(
+            runner.calls[3],
+            vec!["adb", "-s", "emulator-5554", "shell", "wm", "size"]
+        );
+    }
+
+    #[test]
+    fn adb_serial_returns_configured_value_without_shelling_out() {
+        let mut runner = FakeRunner::new(vec![]);
+        {
+            let mut adb = Adb::new(&mut runner, Some("emulator-5554".to_string()));
+            assert_eq!(adb.serial().unwrap(), "emulator-5554");
+        }
+        assert!(
+            runner.calls.is_empty(),
+            "configured serial must not invoke adb: {:?}",
+            runner.calls
+        );
+    }
+
+    #[test]
+    fn adb_serial_without_configured_value_runs_get_serialno() {
+        let mut runner = FakeRunner::new(vec![ok(&["adb"], "fake-serial\n")]);
+        {
+            let mut adb = Adb::new(&mut runner, None);
+            assert_eq!(adb.serial().unwrap(), "fake-serial");
+        }
+        assert_eq!(runner.calls[0], vec!["adb", "get-serialno"]);
+    }
+
+    #[test]
+    fn android_layout_appends_device_flag_for_serial() {
+        let mut runner = FakeRunner::new(vec![ok(&["android"], "[]"), ok(&["android"], "[]")]);
+        {
+            let mut android = AndroidCli::new(&mut runner, Some("emulator-5554".to_string()));
+            android.layout(false).unwrap();
+            android.layout(true).unwrap();
+        }
+        assert_eq!(
+            runner.calls[0],
+            vec!["android", "layout", "--device=emulator-5554"]
+        );
+        assert_eq!(
+            runner.calls[1],
+            vec!["android", "layout", "--diff", "--device=emulator-5554"]
+        );
+    }
+
+    #[test]
+    fn android_screen_commands_set_android_serial_env() {
+        // `android screen capture`/`resolve` have no device flag, so the serial
+        // must arrive via ANDROID_SERIAL on the child process and never as args.
+        let mut runner = FakeRunner::new(vec![
+            ok(&["android"], ""),
+            ok(&["android"], "input tap 1 2"),
+        ]);
+        {
+            let mut android = AndroidCli::new(&mut runner, Some("emulator-5554".to_string()));
+            android.screen_capture("/tmp/shot.png", true).unwrap();
+            android
+                .screen_resolve("/tmp/shot.png", "input tap #3")
+                .unwrap();
+        }
+        let expected = vec![("ANDROID_SERIAL".to_string(), "emulator-5554".to_string())];
+        assert_eq!(runner.envs[0], expected);
+        assert_eq!(runner.envs[1], expected);
+        assert!(runner
+            .calls
+            .iter()
+            .flatten()
+            .all(|arg| !arg.starts_with("--device")));
+    }
+
+    #[test]
+    fn no_serial_leaves_commands_and_env_unchanged() {
+        let mut runner = FakeRunner::new(vec![ok(&["android"], "[]")]);
+        {
+            let mut android = AndroidCli::new(&mut runner, None);
+            android.layout(false).unwrap();
+        }
+        assert_eq!(runner.calls[0], vec!["android", "layout"]);
+        assert!(runner.envs[0].is_empty());
+
+        let mut runner = FakeRunner::new(vec![ok(&["adb"], "")]);
+        {
+            let mut adb = Adb::new(&mut runner, None);
+            adb.tap(TapPoint { x: 1, y: 2 }).unwrap();
+        }
+        assert_eq!(
+            runner.calls[0],
+            vec!["adb", "shell", "input", "tap", "1", "2"]
+        );
+        assert!(runner.envs[0].is_empty());
     }
 }

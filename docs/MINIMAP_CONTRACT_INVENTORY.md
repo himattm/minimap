@@ -1,65 +1,53 @@
-# Minimap CLI Contract Inventory
+# Minimap Lean V1 Contract Inventory
 
-This document records the contract that was ported from the Python reference
-implementation before the Python package was removed. Rust must preserve these
-contracts unless a migration note explicitly approves a change.
+This inventory records the active lean v1 contract. Older Python/Rust 0.1
+contracts are intentionally superseded by the breaking 0.2 refactor.
 
-| Command | Former Python status | Rust status | Writes files | Android CLI | adb |
-|---|---:|---:|---:|---:|---:|
-| `minimap init` | implemented | implemented | yes | no | no |
-| `minimap doctor` | implemented | implemented | no | path check only | path check only |
-| `minimap layout` | implemented | implemented | run artifacts when observing | yes | no |
-| `minimap layout --diff` | implemented | implemented | run artifacts when observing | yes | no |
-| `minimap tap --selector` | implemented | implemented | run artifacts when observing | yes | yes |
-| `minimap tap --point` | implemented | implemented | run artifacts when observing | no | yes |
-| `minimap tap --label` | implemented | implemented | run artifacts when observing | yes | yes |
-| `minimap observe start` | implemented | implemented | yes, gitignored | no | no |
-| `minimap observe stop` | implemented | implemented | yes, gitignored | no | no |
-| `minimap learn --from-current-run --stage` | implemented as review proposal | implemented with multi-step route proposals | proposals | no | no |
-| `minimap accept` | implemented | implemented | graph artifacts | no | no |
-| `minimap route` | implemented | implemented | no | no | no |
-| `minimap go` | implemented skeleton | implemented edge tap execution | run artifacts when observing | yes | yes |
-| `minimap check` | implemented | implemented with current-screen matching | no | yes for current | no |
-| `minimap validate` | not implemented | implemented; dry by default, `--execute` runs selected routes | proposals/state | yes | yes with `--execute` |
-| `minimap drift` | not implemented | implemented | proposals | yes | no |
-| `minimap repair` | not implemented | implemented as staged review proposal | proposals | no | no |
-| `minimap map --discover` | not implemented | implemented as bounded assistant loop | proposals/runs | yes | yes through agent-selected taps |
+| Command | Status | Writes graph | Android CLI | adb |
+|---|---:|---:|---:|---:|
+| `minimap init` | implemented | yes, `.minimap` setup | no | no |
+| `minimap doctor` | implemented | no | path check | path/device check |
+| `minimap whereami` | implemented | only when labeling or self-healing known place | yes | temp-state scope only |
+| `minimap layout` | implemented | no | yes | no |
+| `minimap tap --selector` | implemented | when destination is known/labeled | yes | yes |
+| `minimap tap --point` | implemented | when destination is known/labeled and viewport captured | yes | yes |
+| `minimap tap --screenshot-label` | implemented | when destination is known/labeled and viewport captured | yes | yes |
+| `minimap scroll` | implemented | only if semantic transition is known | yes | yes |
+| `minimap back` | implemented | only if semantic transition is known | yes | yes |
+| `minimap go` | implemented | may self-heal known destination baselines | yes | yes |
 
-## Stable Exit Codes
-
-The Rust implementation preserves this mapping:
+## Stable Status Vocabulary
 
 ```text
-0  success
-1  meaningful change or doctor failure
-2  check/invariant failure or generic command failure
-3  route failed
-4  selector drift
-5  unknown screen / not found
-6  Android CLI/device/environment error
-7  Minimap config/schema error
-8  context mismatch
+ok
+known
+known_changed
+unknown
+needs_label
+label_mismatch
+blocked_by_overlay
+no_known_path
+no_compatible_path
+action_failed
+environment_error
+config_error
 ```
 
-The migration plan originally listed privacy and unsupported-schema-specific
-codes, but Rust follows the existing mapping until a deliberate contract change
-is approved.
+Graph changes return exit code `0` with `changed_graph: true`. Blockers and
+failures return nonzero.
 
-## Golden Fixture Policy
+## Removed Commands
 
-Golden fixtures should capture:
+The following commands are not part of lean v1 and should not appear in help:
 
 ```text
-command
-repo fixture input
-stdout JSON
-stderr
-exit code
-expected file writes
-volatile fields ignored during comparison
+accept
+route
+screen
+observe
+learn
+map
+repair
+undo
+validate
 ```
-
-The Rust CLI fixture set covers `init --dry-run`, route context mismatch,
-`observe`/multi-step `learn`, `layout --diff`, `tap --selector`, `go` edge
-execution, `check --current`, `drift`, `validate --execute`, and
-`map --discover` with fake Android/adb executables.
