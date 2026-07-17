@@ -14,6 +14,74 @@ pub struct CommandResult {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutOutput {
+    pub layout: Value,
+    pub notices: Vec<String>,
+}
+
+/// Normalize the Android CLI's layout stdout into one stable contract.
+///
+/// Current Android CLI releases normally emit a flat JSON array. Some releases
+/// have emitted a JSON-encoded string instead, and update notices may be written
+/// before or after the JSON value. Minimap must not leak either representation
+/// detail to callers.
+pub fn parse_layout_output(stdout: &str) -> Result<LayoutOutput> {
+    parse_layout_output_inner(stdout, 0)
+        .context("Android CLI layout output did not contain a JSON object array")
+}
+
+fn parse_layout_output_inner(stdout: &str, depth: usize) -> Result<LayoutOutput> {
+    if depth > 3 {
+        bail!("Android CLI layout output was encoded too many times");
+    }
+
+    for (start, first) in stdout.char_indices() {
+        if !matches!(first, '[' | '{' | '"') {
+            continue;
+        }
+
+        let candidate = &stdout[start..];
+        let mut values = serde_json::Deserializer::from_str(candidate).into_iter::<Value>();
+        let Some(Ok(value)) = values.next() else {
+            continue;
+        };
+        let end = start + values.byte_offset();
+
+        let mut output = match value {
+            Value::Array(nodes) if nodes.iter().all(Value::is_object) => LayoutOutput {
+                layout: Value::Array(nodes),
+                notices: Vec::new(),
+            },
+            // Legacy/fake Android clients have returned one hierarchy root.
+            // Wrapping it preserves recursive traversal while stabilizing the
+            // public result as an array of element objects.
+            Value::Object(node) => LayoutOutput {
+                layout: Value::Array(vec![Value::Object(node)]),
+                notices: Vec::new(),
+            },
+            Value::String(encoded) => match parse_layout_output_inner(&encoded, depth + 1) {
+                Ok(output) => output,
+                Err(_) => continue,
+            },
+            _ => continue,
+        };
+
+        output.notices.splice(0..0, notice_lines(&stdout[..start]));
+        output.notices.extend(notice_lines(&stdout[end..]));
+        return Ok(output);
+    }
+
+    bail!("no JSON object array found in Android CLI layout output")
+}
+
+fn notice_lines(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 pub trait CommandRunner {
     fn run(&mut self, args: &[String], env: &[(String, String)]) -> Result<CommandResult>;
 }
@@ -274,12 +342,12 @@ fn run_checked<R: CommandRunner>(
 
 pub fn layout_result<R: CommandRunner>(android: &mut AndroidCli<R>, diff: bool) -> Result<Value> {
     let command = android.layout(diff)?;
-    let layout =
-        serde_json::from_str::<Value>(&command.stdout).unwrap_or(Value::String(command.stdout));
+    let output = parse_layout_output(&command.stdout)?;
     let mut result = json!({
         "status": "ok",
         "kind": if diff { "android_layout_diff" } else { "android_layout" },
-        "layout": layout,
+        "layout": output.layout,
+        "android_cli_notices": output.notices,
         "metrics": {
             "layout_calls_total": 1,
             "layout_json_returned_to_agent": true,
@@ -299,7 +367,7 @@ pub fn tap_selector_result<AR: CommandRunner, DR: CommandRunner>(
     reason: Option<&str>,
 ) -> Result<Value> {
     let command = android.layout(false)?;
-    let layout: Value = serde_json::from_str(&command.stdout)?;
+    let layout = parse_layout_output(&command.stdout)?.layout;
     let point = resolve_selector_point(&layout, selector)?;
     adb.tap(point)?;
     let viewport = capture_viewport(adb);
@@ -579,6 +647,39 @@ mod tests {
         let result = layout_result(&mut android, true).unwrap();
         assert_eq!(result["kind"], "android_layout_diff");
         assert_eq!(result["diff_scope"], "android_in_session");
+        assert!(result["layout"].is_array());
+        assert_eq!(result["android_cli_notices"], json!([]));
+    }
+
+    #[test]
+    fn parse_layout_output_accepts_flat_object_array() {
+        let output = parse_layout_output(r#"[{"text":"Home"},{"text":"Settings"}]"#).unwrap();
+        assert_eq!(output.layout[0]["text"], "Home");
+        assert_eq!(output.layout[1]["text"], "Settings");
+        assert!(output.notices.is_empty());
+    }
+
+    #[test]
+    fn parse_layout_output_decodes_string_and_separates_notice() {
+        let stdout = "\"[{\\\"text\\\":\\\"Home\\\"}]\"\nA newer Android CLI is available.\n";
+        let output = parse_layout_output(stdout).unwrap();
+        assert_eq!(output.layout, json!([{"text": "Home"}]));
+        assert_eq!(
+            output.notices,
+            vec!["A newer Android CLI is available.".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_layout_output_wraps_legacy_root_object() {
+        let output = parse_layout_output(r#"{"class":"Column","children":[]}"#).unwrap();
+        assert_eq!(output.layout, json!([{"class": "Column", "children": []}]));
+    }
+
+    #[test]
+    fn parse_layout_output_rejects_non_element_arrays() {
+        let error = parse_layout_output(r#"["not-an-element"]"#).unwrap_err();
+        assert!(error.to_string().contains("JSON object array"));
     }
 
     #[test]
