@@ -703,6 +703,39 @@ fn layout_returns_redacted_layout_and_minimap_metadata() {
 }
 
 #[test]
+fn layout_normalizes_encoded_array_and_reports_android_notices() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["noisy_home"]);
+    write_adb_script(&bin);
+
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+
+    let layout = payload["layout"]
+        .as_array()
+        .expect("layout must be a JSON array, never an encoded string");
+    assert_eq!(layout.len(), 2);
+    assert_eq!(layout[0]["text"], "HOME");
+    assert_eq!(layout[1]["content-desc"], "Settings");
+    assert_eq!(
+        payload["android_cli_notices"],
+        json!(["A newer version of Android CLI is available."])
+    );
+}
+
+#[test]
 fn doctor_reports_healthy_environment() {
     let temp = tempfile::tempdir().unwrap();
     minimap(temp.path())
@@ -1618,6 +1651,9 @@ if [ "$1" = "layout" ]; then
   case "$ITEM" in
     home)
       printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Button","text":"SEARCH","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}}]}}'
+      ;;
+    noisy_home)
+      printf '%s\n%s\n' '"[{{\"text\":\"HOME\"}},{{\"content-desc\":\"Settings\",\"center\":\"[1006,147]\"}}]"' 'A newer version of Android CLI is available.'
       ;;
     search)
       printf '{{"class":"Column","children":[{{"class":"Button","text":"HOME","bounds":{{"left":10,"top":20,"right":100,"bottom":120}}}},{{"class":"Text","text":"Categories"}},{{"class":"Text","text":"Lifestyles"}}]}}'

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use minimap_android::{
-    parse_input_tap, resolve_selector_point, Adb, AndroidCli, CommandRunner, SubprocessRunner,
-    TapPoint,
+    parse_input_tap, parse_layout_output, resolve_selector_point, Adb, AndroidCli, CommandRunner,
+    LayoutOutput, SubprocessRunner, TapPoint,
 };
 use minimap_core::{
     detect_overlay, fingerprint_layout, fingerprint_usable, match_place, normalize_label,
@@ -276,8 +276,15 @@ fn run(cli: Cli) -> Result<i32> {
 }
 
 fn observe_layout<R: CommandRunner>(android: &mut AndroidCli<R>, diff: bool) -> Result<Value> {
+    Ok(observe_layout_output(android, diff)?.layout)
+}
+
+fn observe_layout_output<R: CommandRunner>(
+    android: &mut AndroidCli<R>,
+    diff: bool,
+) -> Result<LayoutOutput> {
     let command = android.layout(diff)?;
-    Ok(serde_json::from_str::<Value>(&command.stdout).unwrap_or(Value::String(command.stdout)))
+    parse_layout_output(&command.stdout)
 }
 
 fn observe_after_action<R: CommandRunner>(
@@ -597,11 +604,16 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
                 edges: Default::default(),
             });
             if let Some(place) = graph_place_for_session(&graph, &session) {
+                // Session files written by older Minimap versions may contain
+                // the raw Android stdout as a JSON string. Normalize on read so
+                // a cache hit cannot reintroduce the unstable public contract.
+                let cached_output = parse_layout_output(&serde_json::to_string(&session.layout)?)?;
                 return Ok(json!({
                     "schema_version": RESULT_SCHEMA_VERSION,
                     "status": "ok",
                     "kind": "android_layout",
-                    "layout": session.layout,
+                    "layout": cached_output.layout,
+                    "android_cli_notices": cached_output.notices,
                     "minimap": layout_minimap_json(
                         &graph,
                         &session.baseline,
@@ -626,7 +638,8 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
         }
     }
 
-    let layout = observe_layout(android, diff)?;
+    let output = observe_layout_output(android, diff)?;
+    let layout = output.layout;
     let (minimap, cache_hit) = if diff {
         (json!({"orientation": "unavailable_for_diff"}), false)
     } else {
@@ -653,6 +666,7 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
         "status": "ok",
         "kind": if diff { "android_layout_diff" } else { "android_layout" },
         "layout": redact_layout(&layout),
+        "android_cli_notices": output.notices,
         "minimap": minimap,
         "cache": {"hit": cache_hit},
         "metrics": {
