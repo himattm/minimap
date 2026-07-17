@@ -184,7 +184,7 @@ pub fn exit_code_for_status(status: &str) -> i32 {
         "needs_label" => 5,
         "unknown" | "no_known_path" | "no_compatible_path" => 5,
         "blocked_by_overlay" | "label_mismatch" | "action_failed" => 2,
-        "environment_error" | "device_unavailable" => 6,
+        "environment_error" | "device_unavailable" | "app_mismatch" => 6,
         "config_error" => 7,
         _ => 2,
     }

@@ -64,6 +64,12 @@ Unlabeled `whereami` returns compact orientation. If either immediately follows 
 fresh verified observation, Minimap can serve the cached session state instead
 of paying for another Android layout capture.
 
+`init` infers the debug application package from a standard Android application
+Gradle module when possible. Before any device-backed navigation or capture,
+Minimap verifies that package against ADB's foreground activity and refuses to
+record another app. Use `--allow-package-mismatch` only for an intentional
+cross-app capture; `doctor` reports missing or ambiguous package configuration.
+
 ## Commands
 
 The v1 command surface is intentionally small:

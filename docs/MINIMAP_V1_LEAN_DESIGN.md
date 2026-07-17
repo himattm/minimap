@@ -154,6 +154,15 @@ short-lived and sized for normal agent decision latency.
 V1 uses one active app profile. The profile fields reserve a mechanical migration
 path for multiple app maps later without adding complexity now.
 
+When the active profile is blank, `init` and runtime validation scan standard
+Android application Gradle modules for a literal `applicationId` and the debug
+build type's `applicationIdSuffix`. One unambiguous result becomes the expected
+debug package; zero or multiple results fail the `app_package` doctor check.
+Every device-backed command compares that expected package with ADB's top
+resumed activity before capture, preventing another foreground app from
+polluting the graph. `--allow-package-mismatch` is the explicit one-command
+override.
+
 ## Graph Schema
 
 Places use product language instead of screen language.
