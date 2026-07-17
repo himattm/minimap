@@ -4,6 +4,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[test]
+fn version_flags_match_the_installed_skill_prerequisite() {
+    let temp = tempfile::tempdir().unwrap();
+    let expected = format!("minimap {}\n", env!("CARGO_PKG_VERSION"));
+
+    for flag in ["--version", "-V"] {
+        minimap(temp.path())
+            .arg(flag)
+            .assert()
+            .success()
+            .stdout(expected.clone());
+    }
+
+    let skill = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/minimap-claude-code/skills/minimap-app-navigation/SKILL.md"),
+    )
+    .unwrap();
+    assert!(skill.contains("`minimap --version`"));
+}
+
+#[test]
 fn init_creates_minimal_layout_and_skill() {
     let temp = tempfile::tempdir().unwrap();
     let output = minimap(temp.path())
