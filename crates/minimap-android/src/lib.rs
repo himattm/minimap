@@ -199,6 +199,13 @@ pub struct AdbDevice {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AndroidDeviceIdentity {
+    pub serial: String,
+    pub model: String,
+    pub api_level: u32,
+}
+
 pub fn parse_input_tap(output: &str) -> Result<TapPoint> {
     let words: Vec<_> = output.split_whitespace().collect();
     for window in words.windows(4) {
@@ -403,6 +410,39 @@ impl<R: CommandRunner> Adb<R> {
         let result = run_checked(&mut self.runner, args, &[])?;
         parse_foreground_package(&result.stdout)
             .context("could not determine Android foreground package from activity state")
+    }
+
+    pub fn device_identity(&mut self) -> Result<AndroidDeviceIdentity> {
+        let serial = self.serial()?;
+        let model = self
+            .getprop(&serial, "ro.product.model")?
+            .trim()
+            .to_string();
+        if model.is_empty() {
+            bail!("Android device `{serial}` did not report ro.product.model");
+        }
+        let api_level = self
+            .getprop(&serial, "ro.build.version.sdk")?
+            .trim()
+            .parse()
+            .with_context(|| format!("Android device `{serial}` reported an invalid API level"))?;
+        Ok(AndroidDeviceIdentity {
+            serial,
+            model,
+            api_level,
+        })
+    }
+
+    fn getprop(&mut self, serial: &str, property: &str) -> Result<String> {
+        let args = vec![
+            self.adb_bin.clone(),
+            "-s".to_string(),
+            serial.to_string(),
+            "shell".to_string(),
+            "getprop".to_string(),
+            property.to_string(),
+        ];
+        Ok(run_checked(&mut self.runner, args, &[])?.stdout)
     }
 }
 
@@ -1333,6 +1373,44 @@ mod tests {
                 "dumpsys",
                 "activity",
                 "activities"
+            ]
+        );
+    }
+
+    #[test]
+    fn adb_device_identity_reports_serial_model_and_api() {
+        let mut runner = FakeRunner::new(vec![ok(&["adb"], "Pixel 9 Pro\n"), ok(&["adb"], "36\n")]);
+        let identity = {
+            let mut adb = Adb::new(&mut runner, Some("emulator-5554".to_string()));
+            adb.device_identity().unwrap()
+        };
+        assert_eq!(
+            identity,
+            AndroidDeviceIdentity {
+                serial: "emulator-5554".to_string(),
+                model: "Pixel 9 Pro".to_string(),
+                api_level: 36
+            }
+        );
+        assert_eq!(
+            runner.calls,
+            vec![
+                vec![
+                    "adb",
+                    "-s",
+                    "emulator-5554",
+                    "shell",
+                    "getprop",
+                    "ro.product.model"
+                ],
+                vec![
+                    "adb",
+                    "-s",
+                    "emulator-5554",
+                    "shell",
+                    "getprop",
+                    "ro.build.version.sdk"
+                ]
             ]
         );
     }

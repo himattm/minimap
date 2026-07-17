@@ -14,7 +14,7 @@ verified places and transitions under `.minimap/graph`.
 Prerequisites: this skill needs the `minimap`, `android`, and `adb` binaries on
 `PATH`. Claude Code plugins cannot install binaries, so if `minimap --version`
 fails, ask the user to install minimap before continuing. If more than one
-device or emulator is attached, pass `--serial <SERIAL>` (or set
+device or emulator is attached, pass `--device <SERIAL>` (or set
 `ANDROID_SERIAL`) so Minimap targets a single device.
 
 Use this command loop:

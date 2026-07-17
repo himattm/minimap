@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use minimap_android::{
     android_analytics_spool_failure, parse_input_tap, parse_layout_output, resolve_selector_point,
-    Adb, AndroidCli, CommandFailure, CommandRunner, LayoutOutput, SubprocessRunner, TapPoint,
+    Adb, AndroidCli, AndroidDeviceIdentity, CommandFailure, CommandRunner, LayoutOutput,
+    SubprocessRunner, TapPoint,
 };
 use minimap_core::{
     detect_overlay, fingerprint_layout, fingerprint_usable, match_place, normalize_label,
@@ -45,8 +46,13 @@ struct Cli {
     #[arg(long = "no-color")]
     no_color: bool,
     /// Android device serial to target when more than one device is attached.
-    #[arg(long, global = true, env = "ANDROID_SERIAL")]
-    serial: Option<String>,
+    #[arg(
+        long = "device",
+        visible_alias = "serial",
+        global = true,
+        env = "ANDROID_SERIAL"
+    )]
+    device: Option<String>,
     /// Allow capture even when the foreground package differs from the active app profile.
     #[arg(long, global = true)]
     allow_package_mismatch: bool,
@@ -153,6 +159,26 @@ struct TapRequest<'a> {
     allow_duplicate_label: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DeviceSelection {
+    serial: Option<String>,
+    source: &'static str,
+}
+
+enum CaptureGuard {
+    Ready(Value),
+    Rejected(Value),
+}
+
+macro_rules! require_ready_device {
+    ($guard:expr) => {
+        match $guard? {
+            CaptureGuard::Ready(device) => device,
+            CaptureGuard::Rejected(result) => return emit_result(result),
+        }
+    };
+}
+
 fn main() {
     let cli = Cli::parse();
     let verbose = cli.verbose;
@@ -202,9 +228,50 @@ fn android_analytics_error_result(error: &anyhow::Error, verbose: bool) -> Optio
     Some(result)
 }
 
+fn resolve_device_selection(root: &Path, requested: Option<String>) -> DeviceSelection {
+    if let Some(serial) = requested.filter(|serial| !serial.trim().is_empty()) {
+        return DeviceSelection {
+            serial: Some(serial),
+            source: "argument_or_environment",
+        };
+    }
+    let configured = load_config(root).ok().and_then(|config| {
+        config
+            .app_profiles
+            .get(&config.active_app_profile)
+            .and_then(|profile| profile.android_device.clone())
+            .filter(|serial| !serial.trim().is_empty())
+    });
+    match configured {
+        Some(serial) => DeviceSelection {
+            serial: Some(serial),
+            source: "config",
+        },
+        None => DeviceSelection {
+            serial: None,
+            source: "single_attached",
+        },
+    }
+}
+
+fn device_json(identity: AndroidDeviceIdentity, selection_source: &str) -> Value {
+    json!({
+        "serial": identity.serial,
+        "model": identity.model,
+        "api_level": identity.api_level,
+        "selection_source": selection_source
+    })
+}
+
+fn attach_device(mut result: Value, device: Value) -> Value {
+    result["device"] = device;
+    result
+}
+
 fn run(cli: Cli) -> Result<i32> {
     let root = PathBuf::from(".");
-    let serial = cli.serial;
+    let selection = resolve_device_selection(&root, cli.device);
+    let serial = selection.serial.clone();
     let allow_package_mismatch = cli.allow_package_mismatch;
     match cli.command {
         Commands::Init {
@@ -228,7 +295,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Commands::Doctor => {
-            let result = doctor(&root, serial.as_deref());
+            let result = doctor(&root, &selection);
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
             Ok(code)
@@ -239,9 +306,12 @@ fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
-            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
-                return emit_result(result);
-            }
+            let device = require_ready_device!(capture_guard_result(
+                &root,
+                &mut adb,
+                allow_package_mismatch,
+                selection.source,
+            ));
             let result = whereami_result(
                 &root,
                 &mut android,
@@ -250,20 +320,19 @@ fn run(cli: Cli) -> Result<i32> {
                 allow_duplicate_label,
                 true,
             )?;
-            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
-            print_json(&result);
-            Ok(code)
+            emit_result(attach_device(result, device))
         }
         Commands::Go { target } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
-            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
-                return emit_result(result);
-            }
+            let device = require_ready_device!(capture_guard_result(
+                &root,
+                &mut adb,
+                allow_package_mismatch,
+                selection.source,
+            ));
             let result = go_result(&root, &mut android, &mut adb, &target)?;
-            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
-            print_json(&result);
-            Ok(code)
+            emit_result(attach_device(result, device))
         }
         Commands::Tap {
             selector,
@@ -276,9 +345,12 @@ fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
-            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
-                return emit_result(result);
-            }
+            let device = require_ready_device!(capture_guard_result(
+                &root,
+                &mut adb,
+                allow_package_mismatch,
+                selection.source,
+            ));
             let result = tap_result(
                 &root,
                 &mut android,
@@ -293,42 +365,43 @@ fn run(cli: Cli) -> Result<i32> {
                     allow_duplicate_label,
                 },
             )?;
-            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
-            print_json(&result);
-            Ok(code)
+            emit_result(attach_device(result, device))
         }
         Commands::Scroll { direction } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
-            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
-                return emit_result(result);
-            }
+            let device = require_ready_device!(capture_guard_result(
+                &root,
+                &mut adb,
+                allow_package_mismatch,
+                selection.source,
+            ));
             let result = scroll_result(&root, &mut android, &mut adb, &direction)?;
-            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
-            print_json(&result);
-            Ok(code)
+            emit_result(attach_device(result, device))
         }
         Commands::Back => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
-            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
-                return emit_result(result);
-            }
+            let device = require_ready_device!(capture_guard_result(
+                &root,
+                &mut adb,
+                allow_package_mismatch,
+                selection.source,
+            ));
             let result = back_result(&root, &mut android, &mut adb)?;
-            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
-            print_json(&result);
-            Ok(code)
+            emit_result(attach_device(result, device))
         }
         Commands::Layout { diff } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
-            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
-                return emit_result(result);
-            }
+            let device = require_ready_device!(capture_guard_result(
+                &root,
+                &mut adb,
+                allow_package_mismatch,
+                selection.source,
+            ));
             let result = layout_result(&root, &mut android, &mut adb, diff)?;
-            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
-            print_json(&result);
-            Ok(code)
+            emit_result(attach_device(result, device))
         }
     }
 }
@@ -740,86 +813,118 @@ fn capture_guard_result<R: CommandRunner>(
     root: &Path,
     adb: &mut Adb<R>,
     allow_package_mismatch: bool,
-) -> Result<Option<Value>> {
+    selection_source: &str,
+) -> Result<CaptureGuard> {
     if let Some(result) = device_unavailable_result(adb)? {
-        return Ok(Some(result));
+        return Ok(CaptureGuard::Rejected(result));
     }
+
+    let identity = match adb.device_identity() {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Ok(CaptureGuard::Rejected(json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "environment_error",
+                "summary": "Android device identity could not be read",
+                "error": {
+                    "code": "device_identity_unavailable",
+                    "detail": error.to_string(),
+                    "recovery": "Verify ADB can read ro.product.model and ro.build.version.sdk from the selected device."
+                },
+                "changed_graph": false,
+                "changed_files": []
+            })));
+        }
+    };
+    let device = device_json(identity, selection_source);
 
     let resolution = resolve_app_package(root)?;
     let (expected_package, source) = match resolution {
         AppPackageResolution::Configured { package, .. } => (package, "config"),
         AppPackageResolution::Inferred { package, .. } => (package, "gradle_debug_variant"),
         AppPackageResolution::Missing { profile } => {
-            return Ok(Some(json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "config_error",
-                "summary": "Android application package is not configured and could not be inferred",
-                "error": {
-                    "code": "app_package_missing",
-                    "profile": profile,
-                    "recovery": "Set app_profiles.<profile>.android_package or add an inferable Android application Gradle module."
-                },
-                "changed_graph": false,
-                "changed_files": []
-            })));
+            return Ok(CaptureGuard::Rejected(attach_device(
+                json!({
+                    "schema_version": RESULT_SCHEMA_VERSION,
+                    "status": "config_error",
+                    "summary": "Android application package is not configured and could not be inferred",
+                    "error": {
+                        "code": "app_package_missing",
+                        "profile": profile,
+                        "recovery": "Set app_profiles.<profile>.android_package or add an inferable Android application Gradle module."
+                    },
+                    "changed_graph": false,
+                    "changed_files": []
+                }),
+                device,
+            )));
         }
         AppPackageResolution::Ambiguous {
             profile,
             candidates,
         } => {
-            return Ok(Some(json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "config_error",
-                "summary": "Multiple Android application packages were inferred",
-                "error": {
-                    "code": "app_package_ambiguous",
-                    "profile": profile,
-                    "candidates": candidates,
-                    "recovery": "Set android_package explicitly for the active app profile."
-                },
-                "changed_graph": false,
-                "changed_files": []
-            })));
+            return Ok(CaptureGuard::Rejected(attach_device(
+                json!({
+                    "schema_version": RESULT_SCHEMA_VERSION,
+                    "status": "config_error",
+                    "summary": "Multiple Android application packages were inferred",
+                    "error": {
+                        "code": "app_package_ambiguous",
+                        "profile": profile,
+                        "candidates": candidates,
+                        "recovery": "Set android_package explicitly for the active app profile."
+                    },
+                    "changed_graph": false,
+                    "changed_files": []
+                }),
+                device,
+            )));
         }
     };
 
     let foreground_package = match adb.foreground_package() {
         Ok(package) => package,
-        Err(_) if allow_package_mismatch => return Ok(None),
+        Err(_) if allow_package_mismatch => return Ok(CaptureGuard::Ready(device)),
         Err(error) => {
-            return Ok(Some(json!({
-                "schema_version": RESULT_SCHEMA_VERSION,
-                "status": "environment_error",
-                "summary": "Android foreground package could not be verified",
-                "error": {
-                    "code": "foreground_package_unknown",
-                    "expected_package": expected_package,
-                    "expected_package_source": source,
-                    "detail": error.to_string(),
-                    "recovery": "Launch the expected app and retry, or pass --allow-package-mismatch to override this guard."
-                },
-                "changed_graph": false,
-                "changed_files": []
-            })));
+            return Ok(CaptureGuard::Rejected(attach_device(
+                json!({
+                    "schema_version": RESULT_SCHEMA_VERSION,
+                    "status": "environment_error",
+                    "summary": "Android foreground package could not be verified",
+                    "error": {
+                        "code": "foreground_package_unknown",
+                        "expected_package": expected_package,
+                        "expected_package_source": source,
+                        "detail": error.to_string(),
+                        "recovery": "Launch the expected app and retry, or pass --allow-package-mismatch to override this guard."
+                    },
+                    "changed_graph": false,
+                    "changed_files": []
+                }),
+                device,
+            )));
         }
     };
     if foreground_package != expected_package && !allow_package_mismatch {
-        return Ok(Some(json!({
-            "schema_version": RESULT_SCHEMA_VERSION,
-            "status": "app_mismatch",
-            "summary": "Foreground Android app does not match the active Minimap app profile",
-            "error": {
-                "code": "foreground_package_mismatch",
-                "expected_package": expected_package,
-                "expected_package_source": source,
-                "foreground_package": foreground_package,
-                "recovery": "Bring the expected app to the foreground, or pass --allow-package-mismatch for this capture."
-            },
-            "changed_graph": false,
-            "changed_files": []
-        })));
+        return Ok(CaptureGuard::Rejected(attach_device(
+            json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "app_mismatch",
+                "summary": "Foreground Android app does not match the active Minimap app profile",
+                "error": {
+                    "code": "foreground_package_mismatch",
+                    "expected_package": expected_package,
+                    "expected_package_source": source,
+                    "foreground_package": foreground_package,
+                    "recovery": "Bring the expected app to the foreground, or pass --allow-package-mismatch for this capture."
+                },
+                "changed_graph": false,
+                "changed_files": []
+            }),
+            device,
+        )));
     }
-    Ok(None)
+    Ok(CaptureGuard::Ready(device))
 }
 
 fn device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Result<Option<Value>> {
@@ -828,15 +933,26 @@ fn device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Result<Optio
     let selected = attempted_serial
         .as_ref()
         .and_then(|serial| devices.iter().find(|device| device.serial == *serial));
+    let ready_devices = devices
+        .iter()
+        .filter(|device| device.state == "device")
+        .count();
     let ready = match &attempted_serial {
         Some(_) => selected.is_some_and(|device| device.state == "device"),
-        None => devices.iter().any(|device| device.state == "device"),
+        None => ready_devices == 1,
     };
     if ready {
         return Ok(None);
     }
 
-    let (code, summary, recovery) = if devices.is_empty() {
+    let (code, summary, recovery) = if attempted_serial.is_none() && ready_devices > 1 {
+        (
+            "device_ambiguous",
+            "multiple ready Android devices require an explicit selection".to_string(),
+            "Pass --device <SERIAL>, set ANDROID_SERIAL, or configure android_device for the active app profile."
+                .to_string(),
+        )
+    } else if devices.is_empty() {
         (
             "no_device",
             "no connected Android device is available".to_string(),
@@ -847,7 +963,7 @@ fn device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Result<Optio
             (
                 "device_not_found",
                 format!("selected Android device `{serial}` is not attached"),
-                format!("Start or connect `{serial}`, or choose an attached device with --serial."),
+                format!("Start or connect `{serial}`, or choose an attached device with --device."),
             )
         } else {
             (
@@ -1634,7 +1750,8 @@ fn execute_recipe<AR: CommandRunner, DR: CommandRunner>(
     Ok(())
 }
 
-fn doctor(root: &Path, serial: Option<&str>) -> Value {
+fn doctor(root: &Path, selection: &DeviceSelection) -> Value {
+    let serial = selection.serial.as_deref();
     let repo_checks = validate_graph(root);
     let repo_ok = repo_checks.iter().all(|check| check["status"] == "pass");
     let android_ok = command_on_path("android");
@@ -1643,17 +1760,31 @@ fn doctor(root: &Path, serial: Option<&str>) -> Value {
     // adb/android call ambiguous, so fail the device check with a fix instead
     // of surfacing adb's opaque "more than one device" error.
     let multi_device = serial.is_none() && adb_ok && adb_devices_in_device_state() > 1;
-    let device_ok = adb_ok && !multi_device && adb_device_ready(serial);
+    let device_ready = adb_ok && !multi_device && adb_device_ready(serial);
+    let device_identity = if device_ready {
+        Adb::new(SubprocessRunner, selection.serial.clone())
+            .device_identity()
+            .ok()
+    } else {
+        None
+    };
+    let device_ok = device_identity.is_some();
     let mut device_check = json!({
         "name": "device",
         "status": if device_ok { "pass" } else { "fail" }
     });
     if multi_device {
         device_check["hint"] =
-            json!("multiple devices attached; pass --serial or set ANDROID_SERIAL");
+            json!("multiple devices attached; pass --device or set ANDROID_SERIAL");
     }
-    if let Some(serial) = serial {
+    if let Some(identity) = device_identity {
+        device_check["serial"] = json!(identity.serial);
+        device_check["model"] = json!(identity.model);
+        device_check["api_level"] = json!(identity.api_level);
+        device_check["selection_source"] = json!(selection.source);
+    } else if let Some(serial) = serial {
         device_check["serial"] = json!(serial);
+        device_check["selection_source"] = json!(selection.source);
     }
     json!({
         "schema_version": RESULT_SCHEMA_VERSION,
