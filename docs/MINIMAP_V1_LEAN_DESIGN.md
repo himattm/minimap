@@ -50,6 +50,10 @@ minimap layout
 `doctor` is read-only. It checks repo health and device readiness separately:
 config exists and parses, graph JSON is valid, labels are unique, edges do not
 dangle, `android` is available, `adb` is available, and a device is reachable.
+`doctor --live` then verifies the foreground package and performs one minimal
+layout capture. It stops at the failing layer and reports distinct device,
+app-mismatch, analytics-permission, and layout-output diagnostics; `--verbose`
+retains the underlying subprocess exception.
 
 `whereami` calls `android layout` once, matches the current layout to the graph,
 and returns compact orientation only. When Minimap has a very fresh verified

@@ -1082,6 +1082,101 @@ fn doctor_reports_healthy_environment() {
 }
 
 #[test]
+fn live_doctor_separates_device_app_capture_and_analytics_failures() {
+    let healthy = tempfile::tempdir().unwrap();
+    minimap(healthy.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(healthy.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script(&bin);
+    let success = minimap(healthy.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor", "--live"])
+        .assert()
+        .success();
+    let payload: Value = serde_json::from_slice(&success.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["checks"]["live"][0]["name"], "foreground_app");
+    assert_eq!(payload["checks"]["live"][0]["status"], "pass");
+    assert_eq!(payload["checks"]["live"][1]["name"], "layout_capture");
+    assert_eq!(payload["checks"]["live"][1]["status"], "pass");
+
+    let no_device = tempfile::tempdir().unwrap();
+    minimap(no_device.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(no_device.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_no_devices(&bin);
+    let failure = minimap(no_device.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor", "--live"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "environment_error");
+    assert_eq!(payload["checks"]["environment"][2]["code"], "no_device");
+
+    let wrong_app = tempfile::tempdir().unwrap();
+    minimap(wrong_app.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    set_android_package(wrong_app.path(), "llc.wandersail.getgoing.debug");
+    let bin = fake_bin(wrong_app.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_with_foreground(&bin, "com.example.unrelated");
+    let failure = minimap(wrong_app.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor", "--live"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "app_mismatch");
+    assert_eq!(
+        payload["checks"]["live"][0]["code"],
+        "foreground_package_mismatch"
+    );
+    assert!(!bin.join("android-count").exists());
+
+    let analytics = tempfile::tempdir().unwrap();
+    minimap(analytics.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(analytics.path());
+    write_android_analytics_failure_script(&bin);
+    write_adb_script(&bin);
+    let failure = minimap(analytics.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor", "--live"])
+        .assert()
+        .code(6);
+    let stdout = String::from_utf8(failure.get_output().stdout.clone()).unwrap();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["status"], "environment_error");
+    assert_eq!(
+        payload["checks"]["live"][1]["code"],
+        "android_cli_analytics_spool_unwritable"
+    );
+    assert!(!stdout.contains("JournalingUsageTracker"));
+
+    let verbose = minimap(analytics.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["--verbose", "doctor", "--live"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&verbose.get_output().stdout).unwrap();
+    assert!(payload["checks"]["live"][1]["debug"]["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("JournalingUsageTracker"));
+}
+
+#[test]
 fn doctor_reports_missing_app_package_when_gradle_is_not_inferable() {
     let temp = tempfile::tempdir().unwrap();
     minimap(temp.path())
