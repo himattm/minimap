@@ -316,6 +316,19 @@ impl<R: CommandRunner> Adb<R> {
         let result = run_checked(&mut self.runner, args, &[])?;
         parse_wm_size(&result.stdout)
     }
+
+    pub fn foreground_package(&mut self) -> Result<String> {
+        let mut args = self.base_args();
+        args.extend([
+            "shell".to_string(),
+            "dumpsys".to_string(),
+            "activity".to_string(),
+            "activities".to_string(),
+        ]);
+        let result = run_checked(&mut self.runner, args, &[])?;
+        parse_foreground_package(&result.stdout)
+            .context("could not determine Android foreground package from activity state")
+    }
 }
 
 pub fn parse_adb_devices(stdout: &str) -> Vec<AdbDevice> {
@@ -333,6 +346,37 @@ pub fn parse_adb_devices(stdout: &str) -> Vec<AdbDevice> {
             })
         })
         .collect()
+}
+
+pub fn parse_foreground_package(stdout: &str) -> Option<String> {
+    for marker in [
+        "topResumedActivity=",
+        "mResumedActivity:",
+        "ResumedActivity:",
+    ] {
+        for line in stdout.lines().filter(|line| line.contains(marker)) {
+            if let Some(package) = line.split_whitespace().find_map(component_package) {
+                return Some(package);
+            }
+        }
+    }
+    None
+}
+
+fn component_package(token: &str) -> Option<String> {
+    let token = token.trim_matches(|character: char| {
+        matches!(character, '{' | '}' | '[' | ']' | '(' | ')' | ',')
+    });
+    let (package, _) = token.split_once('/')?;
+    let package = package.trim_start_matches(|character: char| {
+        !character.is_ascii_alphanumeric() && character != '_'
+    });
+    (!package.is_empty()
+        && package.contains('.')
+        && package
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_')))
+    .then(|| package.to_string())
 }
 
 /// Parse `adb shell wm size` output. When `Override size:` is present it wins
@@ -1150,6 +1194,39 @@ mod tests {
                     serial: "phone-1".to_string(),
                     state: "unauthorized".to_string(),
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_foreground_package_uses_top_resumed_activity() {
+        let output = "topResumedActivity=ActivityRecord{125305998 u0 llc.wandersail.getgoing.debug/llc.wandersail.getgoing.MainActivity t8142}\n";
+        assert_eq!(
+            parse_foreground_package(output).as_deref(),
+            Some("llc.wandersail.getgoing.debug")
+        );
+    }
+
+    #[test]
+    fn adb_foreground_package_targets_configured_serial() {
+        let mut runner = FakeRunner::new(vec![ok(
+            &["adb"],
+            "topResumedActivity=ActivityRecord{1 u0 com.example.app/.MainActivity t1}\n",
+        )]);
+        {
+            let mut adb = Adb::new(&mut runner, Some("emulator-5554".to_string()));
+            assert_eq!(adb.foreground_package().unwrap(), "com.example.app");
+        }
+        assert_eq!(
+            runner.calls[0],
+            vec![
+                "adb",
+                "-s",
+                "emulator-5554",
+                "shell",
+                "dumpsys",
+                "activity",
+                "activities"
             ]
         );
     }

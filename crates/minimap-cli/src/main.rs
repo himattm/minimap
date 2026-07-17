@@ -10,8 +10,8 @@ use minimap_core::{
 };
 use minimap_graph::{exit_code_for_status, resolve_path};
 use minimap_repo::{
-    commit_edge, commit_place, edge_path, load_config, load_graph, remove_place_file, run_init,
-    validate_graph, Graph, InitOptions,
+    commit_edge, commit_place, edge_path, load_config, load_graph, remove_place_file,
+    resolve_app_package, run_init, validate_graph, AppPackageResolution, Graph, InitOptions,
 };
 use minimap_schemas::{
     canonical_json, ActionStep, Edge, EdgeEndpoint, MinimapResult, Place, PlaceBaseline, Point,
@@ -44,6 +44,9 @@ struct Cli {
     /// Android device serial to target when more than one device is attached.
     #[arg(long, global = true, env = "ANDROID_SERIAL")]
     serial: Option<String>,
+    /// Allow capture even when the foreground package differs from the active app profile.
+    #[arg(long, global = true)]
+    allow_package_mismatch: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -167,6 +170,7 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let root = PathBuf::from(".");
     let serial = cli.serial;
+    let allow_package_mismatch = cli.allow_package_mismatch;
     match cli.command {
         Commands::Init {
             dry_run,
@@ -200,6 +204,9 @@ fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
+            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
+                return emit_result(result);
+            }
             let result = whereami_result(
                 &root,
                 &mut android,
@@ -215,6 +222,9 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Go { target } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
+            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
+                return emit_result(result);
+            }
             let result = go_result(&root, &mut android, &mut adb, &target)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
@@ -231,6 +241,9 @@ fn run(cli: Cli) -> Result<i32> {
         } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
+            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
+                return emit_result(result);
+            }
             let result = tap_result(
                 &root,
                 &mut android,
@@ -252,6 +265,9 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Scroll { direction } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
+            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
+                return emit_result(result);
+            }
             let result = scroll_result(&root, &mut android, &mut adb, &direction)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
@@ -260,6 +276,9 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Back => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
+            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
+                return emit_result(result);
+            }
             let result = back_result(&root, &mut android, &mut adb)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
@@ -268,6 +287,9 @@ fn run(cli: Cli) -> Result<i32> {
         Commands::Layout { diff } => {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
+            if let Some(result) = capture_guard_result(&root, &mut adb, allow_package_mismatch)? {
+                return emit_result(result);
+            }
             let result = layout_result(&root, &mut android, &mut adb, diff)?;
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
@@ -596,10 +618,6 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
     adb: &mut Adb<DR>,
     diff: bool,
 ) -> Result<Value> {
-    if let Some(result) = layout_device_unavailable_result(adb)? {
-        return Ok(result);
-    }
-
     if !diff {
         if let Some(session) =
             load_recent_session_place(root, adb, Duration::from_secs(LAYOUT_CACHE_TTL_SECS))?
@@ -683,7 +701,93 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
     }))
 }
 
-fn layout_device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Result<Option<Value>> {
+fn capture_guard_result<R: CommandRunner>(
+    root: &Path,
+    adb: &mut Adb<R>,
+    allow_package_mismatch: bool,
+) -> Result<Option<Value>> {
+    if let Some(result) = device_unavailable_result(adb)? {
+        return Ok(Some(result));
+    }
+
+    let resolution = resolve_app_package(root)?;
+    let (expected_package, source) = match resolution {
+        AppPackageResolution::Configured { package, .. } => (package, "config"),
+        AppPackageResolution::Inferred { package, .. } => (package, "gradle_debug_variant"),
+        AppPackageResolution::Missing { profile } => {
+            return Ok(Some(json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "config_error",
+                "summary": "Android application package is not configured and could not be inferred",
+                "error": {
+                    "code": "app_package_missing",
+                    "profile": profile,
+                    "recovery": "Set app_profiles.<profile>.android_package or add an inferable Android application Gradle module."
+                },
+                "changed_graph": false,
+                "changed_files": []
+            })));
+        }
+        AppPackageResolution::Ambiguous {
+            profile,
+            candidates,
+        } => {
+            return Ok(Some(json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "config_error",
+                "summary": "Multiple Android application packages were inferred",
+                "error": {
+                    "code": "app_package_ambiguous",
+                    "profile": profile,
+                    "candidates": candidates,
+                    "recovery": "Set android_package explicitly for the active app profile."
+                },
+                "changed_graph": false,
+                "changed_files": []
+            })));
+        }
+    };
+
+    let foreground_package = match adb.foreground_package() {
+        Ok(package) => package,
+        Err(_) if allow_package_mismatch => return Ok(None),
+        Err(error) => {
+            return Ok(Some(json!({
+                "schema_version": RESULT_SCHEMA_VERSION,
+                "status": "environment_error",
+                "summary": "Android foreground package could not be verified",
+                "error": {
+                    "code": "foreground_package_unknown",
+                    "expected_package": expected_package,
+                    "expected_package_source": source,
+                    "detail": error.to_string(),
+                    "recovery": "Launch the expected app and retry, or pass --allow-package-mismatch to override this guard."
+                },
+                "changed_graph": false,
+                "changed_files": []
+            })));
+        }
+    };
+    if foreground_package != expected_package && !allow_package_mismatch {
+        return Ok(Some(json!({
+            "schema_version": RESULT_SCHEMA_VERSION,
+            "status": "app_mismatch",
+            "summary": "Foreground Android app does not match the active Minimap app profile",
+            "error": {
+                "code": "foreground_package_mismatch",
+                "expected_package": expected_package,
+                "expected_package_source": source,
+                "foreground_package": foreground_package,
+                "recovery": "Bring the expected app to the foreground, or pass --allow-package-mismatch for this capture."
+            },
+            "changed_graph": false,
+            "changed_files": []
+        })));
+    }
+    Ok(None)
+}
+
+fn device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Result<Option<Value>> {
     let devices = adb.devices()?;
     let attempted_serial = adb.configured_serial().map(str::to_string);
     let selected = attempted_serial
@@ -749,6 +853,12 @@ fn layout_device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Resul
         "changed_graph": false,
         "changed_files": []
     })))
+}
+
+fn emit_result(result: Value) -> Result<i32> {
+    let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
+    print_json(&result);
+    Ok(code)
 }
 
 fn tap_result<AR: CommandRunner, DR: CommandRunner>(

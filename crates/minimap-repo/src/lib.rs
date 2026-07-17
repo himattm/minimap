@@ -65,16 +65,214 @@ pub struct InitOptions<'a> {
 }
 
 pub fn default_config() -> MinimapConfig {
+    config_with_package(String::new())
+}
+
+fn default_config_for_root(root: &Path) -> MinimapConfig {
+    let package = inferred_debug_packages(root)
+        .ok()
+        .and_then(|packages| {
+            let unique: BTreeSet<_> = packages
+                .into_iter()
+                .map(|candidate| candidate.package)
+                .collect();
+            (unique.len() == 1).then(|| unique.into_iter().next().unwrap())
+        })
+        .unwrap_or_default();
+    config_with_package(package)
+}
+
+fn config_with_package(android_package: String) -> MinimapConfig {
     MinimapConfig {
         schema_version: CONFIG_SCHEMA_VERSION.to_string(),
         active_app_profile: "default".to_string(),
-        app_profiles: BTreeMap::from([(
-            "default".to_string(),
-            AppProfile {
-                android_package: String::new(),
-            },
-        )]),
+        app_profiles: BTreeMap::from([("default".to_string(), AppProfile { android_package })]),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferredAppPackage {
+    pub package: String,
+    pub build_file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppPackageResolution {
+    Configured {
+        package: String,
+        profile: String,
+    },
+    Inferred {
+        package: String,
+        build_files: Vec<PathBuf>,
+    },
+    Missing {
+        profile: String,
+    },
+    Ambiguous {
+        profile: String,
+        candidates: Vec<String>,
+    },
+}
+
+impl AppPackageResolution {
+    pub fn package(&self) -> Option<&str> {
+        match self {
+            Self::Configured { package, .. } | Self::Inferred { package, .. } => Some(package),
+            Self::Missing { .. } | Self::Ambiguous { .. } => None,
+        }
+    }
+}
+
+pub fn resolve_app_package(root: &Path) -> Result<AppPackageResolution> {
+    let config = load_config(root)?;
+    let profile_name = config.active_app_profile;
+    let profile = config.app_profiles.get(&profile_name).with_context(|| {
+        format!("active app profile `{profile_name}` is missing from app_profiles")
+    })?;
+    let configured = profile.android_package.trim();
+    if !configured.is_empty() {
+        return Ok(AppPackageResolution::Configured {
+            package: configured.to_string(),
+            profile: profile_name,
+        });
+    }
+
+    let inferred = inferred_debug_packages(root)?;
+    let mut files_by_package: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for candidate in inferred {
+        files_by_package
+            .entry(candidate.package)
+            .or_default()
+            .push(candidate.build_file);
+    }
+    match files_by_package.len() {
+        0 => Ok(AppPackageResolution::Missing {
+            profile: profile_name,
+        }),
+        1 => {
+            let (package, build_files) = files_by_package.into_iter().next().unwrap();
+            Ok(AppPackageResolution::Inferred {
+                package,
+                build_files,
+            })
+        }
+        _ => Ok(AppPackageResolution::Ambiguous {
+            profile: profile_name,
+            candidates: files_by_package.into_keys().collect(),
+        }),
+    }
+}
+
+fn inferred_debug_packages(root: &Path) -> Result<Vec<InferredAppPackage>> {
+    let mut build_files = Vec::new();
+    for name in ["build.gradle.kts", "build.gradle"] {
+        let path = root.join(name);
+        if path.is_file() {
+            build_files.push(path);
+        }
+    }
+    if root.is_dir() {
+        for entry in fs::read_dir(root)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            for name in ["build.gradle.kts", "build.gradle"] {
+                let build_file = path.join(name);
+                if build_file.is_file() {
+                    build_files.push(build_file);
+                }
+            }
+        }
+    }
+    build_files.sort();
+
+    let mut candidates = Vec::new();
+    for build_file in build_files {
+        let script = fs::read_to_string(&build_file)?;
+        if !is_android_application_script(&script) {
+            continue;
+        }
+        let suffix = debug_application_id_suffix(&script).unwrap_or_default();
+        for application_id in quoted_assignments(&script, "applicationId") {
+            candidates.push(InferredAppPackage {
+                package: format!("{application_id}{suffix}"),
+                build_file: build_file.clone(),
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+fn is_android_application_script(script: &str) -> bool {
+    script.contains("com.android.application") || script.contains("android.application")
+}
+
+fn quoted_assignments(script: &str, key: &str) -> Vec<String> {
+    script
+        .lines()
+        .filter_map(|line| quoted_assignment(line, key))
+        .collect()
+}
+
+fn quoted_assignment(line: &str, key: &str) -> Option<String> {
+    let code = line.split("//").next()?.trim();
+    let rest = code.strip_prefix(key)?;
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    let quote_index = rest.find(['"', '\''])?;
+    let quote = rest.as_bytes()[quote_index] as char;
+    let value = &rest[quote_index + 1..];
+    let end = value.find(quote)?;
+    let value = value[..end].trim();
+    (!value.is_empty() && !value.contains('$')).then(|| value.to_string())
+}
+
+fn debug_application_id_suffix(script: &str) -> Option<String> {
+    let mut in_debug = false;
+    let mut depth = 0_i32;
+    for line in script.lines() {
+        let code = line.split("//").next().unwrap_or_default().trim();
+        let starts_debug = !in_debug
+            && (code.starts_with("debug {")
+                || code.contains("getByName(\"debug\")")
+                || code.contains("getByName('debug')"));
+        if starts_debug {
+            in_debug = true;
+            depth = brace_delta(code);
+            if let Some(suffix) = quoted_assignment(code, "applicationIdSuffix") {
+                return Some(suffix);
+            }
+            if depth <= 0 {
+                in_debug = false;
+            }
+            continue;
+        }
+        if in_debug {
+            if let Some(suffix) = quoted_assignment(code, "applicationIdSuffix") {
+                return Some(suffix);
+            }
+            depth += brace_delta(code);
+            if depth <= 0 {
+                in_debug = false;
+            }
+        }
+    }
+    None
+}
+
+fn brace_delta(line: &str) -> i32 {
+    line.chars().fold(0, |depth, character| match character {
+        '{' => depth + 1,
+        '}' => depth - 1,
+        _ => depth,
+    })
 }
 
 pub fn detect_legacy_minimap(root: &Path) -> Vec<String> {
@@ -243,7 +441,9 @@ fn apply_init(
         let path = root.join(&change.path);
         match (change.kind.as_str(), change.status.as_str()) {
             ("directory", "create") => fs::create_dir_all(&path)?,
-            ("config", "create") => write_json(&path, &serde_json::to_value(default_config())?)?,
+            ("config", "create") => {
+                write_json(&path, &serde_json::to_value(default_config_for_root(root))?)?
+            }
             ("skill", "create") | ("skill", "refresh")
                 if refresh_skills || change.status == "create" =>
             {
@@ -478,6 +678,51 @@ pub fn validate_graph(root: &Path) -> Vec<Value> {
             None
         }
     };
+    if config.is_some() {
+        checks.push(match resolve_app_package(root) {
+            Ok(AppPackageResolution::Configured { package, profile }) => json!({
+                "name": "app_package",
+                "status": "pass",
+                "source": "config",
+                "profile": profile,
+                "package": package
+            }),
+            Ok(AppPackageResolution::Inferred {
+                package,
+                build_files,
+            }) => json!({
+                "name": "app_package",
+                "status": "pass",
+                "source": "gradle_debug_variant",
+                "package": package,
+                "build_files": build_files
+            }),
+            Ok(AppPackageResolution::Missing { profile }) => json!({
+                "name": "app_package",
+                "status": "fail",
+                "code": "app_package_missing",
+                "profile": profile,
+                "detail": "configure android_package or add an inferable Android application module"
+            }),
+            Ok(AppPackageResolution::Ambiguous {
+                profile,
+                candidates,
+            }) => json!({
+                "name": "app_package",
+                "status": "fail",
+                "code": "app_package_ambiguous",
+                "profile": profile,
+                "candidates": candidates,
+                "detail": "configure android_package for the active app profile"
+            }),
+            Err(error) => json!({
+                "name": "app_package",
+                "status": "fail",
+                "code": "app_package_invalid",
+                "detail": error.to_string()
+            }),
+        });
+    }
     match scan_place_ids(&root.join(".minimap/graph/places")) {
         Ok(()) => checks.push(json!({"name": "place_ids", "status": "pass"})),
         Err(error) => {

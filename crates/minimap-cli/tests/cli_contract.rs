@@ -56,6 +56,23 @@ fn init_force_replaces_legacy_layout() {
 }
 
 #[test]
+fn init_infers_debug_application_id_from_gradle() {
+    let temp = tempfile::tempdir().unwrap();
+    write_android_application_gradle(temp.path(), "llc.wandersail.getgoing", Some(".debug"));
+
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+
+    let config = read_json_path(&temp.path().join(".minimap/config.json"));
+    assert_eq!(
+        config["app_profiles"]["default"]["android_package"],
+        "llc.wandersail.getgoing.debug"
+    );
+}
+
+#[test]
 fn help_exposes_only_lean_commands() {
     let temp = tempfile::tempdir().unwrap();
     let output = minimap(temp.path())
@@ -853,6 +870,62 @@ fn layout_reports_attempted_serial_and_attached_devices() {
 }
 
 #[test]
+fn layout_refuses_wrong_foreground_package_unless_overridden() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    set_android_package(temp.path(), "llc.wandersail.getgoing.debug");
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_with_foreground(&bin, "com.example.unrelated");
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "app_mismatch");
+    assert_eq!(payload["error"]["code"], "foreground_package_mismatch");
+    assert_eq!(
+        payload["error"]["expected_package"],
+        "llc.wandersail.getgoing.debug"
+    );
+    assert_eq!(
+        payload["error"]["foreground_package"],
+        "com.example.unrelated"
+    );
+    assert!(
+        !bin.join("android-count").exists(),
+        "wrong-app guard must run before Android layout capture"
+    );
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "wrong-app"])
+        .assert()
+        .code(6);
+    assert!(
+        fs::read_dir(temp.path().join(".minimap/graph/places"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "wrong foreground app must not write navigation memory"
+    );
+
+    let success = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["--allow-package-mismatch", "layout"])
+        .assert()
+        .success();
+    let payload: Value = serde_json::from_slice(&success.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert!(payload["layout"].is_array());
+}
+
+#[test]
 fn doctor_reports_healthy_environment() {
     let temp = tempfile::tempdir().unwrap();
     minimap(temp.path())
@@ -875,6 +948,68 @@ fn doctor_reports_healthy_environment() {
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["repo_ok"], true);
     assert_eq!(payload["device_ok"], true);
+}
+
+#[test]
+fn doctor_reports_missing_app_package_when_gradle_is_not_inferable() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script(&bin);
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor"])
+        .assert()
+        .code(7);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    let check = payload["checks"]["repo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "app_package")
+        .expect("doctor must include the app_package check");
+    assert_eq!(check["status"], "fail");
+    assert_eq!(check["code"], "app_package_missing");
+}
+
+#[test]
+fn doctor_reports_ambiguous_inferred_app_packages() {
+    let temp = tempfile::tempdir().unwrap();
+    write_android_application_gradle_module(temp.path(), "phone", "com.example.phone", None);
+    write_android_application_gradle_module(temp.path(), "wear", "com.example.wear", None);
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script(&bin);
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["doctor"])
+        .assert()
+        .code(7);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    let check = payload["checks"]["repo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "app_package")
+        .unwrap();
+    assert_eq!(check["status"], "fail");
+    assert_eq!(check["code"], "app_package_ambiguous");
+    assert_eq!(
+        check["candidates"],
+        json!(["com.example.phone", "com.example.wear"])
+    );
 }
 
 #[test]
@@ -1720,6 +1855,9 @@ fn minimap(cwd: &Path) -> Command {
 }
 
 fn fake_bin(root: &Path) -> PathBuf {
+    // Device-backed contract tests model a normal Android application repo so
+    // Minimap can infer and verify the active debug package.
+    write_android_application_gradle(root, "com.example.app", None);
     let bin = root.join("fake-bin");
     fs::create_dir_all(&bin).unwrap();
     bin
@@ -1840,6 +1978,34 @@ fn write_adb_script(bin: &Path) {
     write_adb_script_with_size(bin, "1080x2400");
 }
 
+fn write_adb_script_with_foreground(bin: &Path, package: &str) {
+    let body = format!(
+        r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nfake-serial\tdevice\n'
+  exit 0
+fi
+if [ "$1" = "get-serialno" ]; then
+  printf 'fake-serial\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
+  printf 'topResumedActivity=ActivityRecord{{123 u0 {package}/.MainActivity t1}}\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
+  printf 'Physical size: 1080x2400\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "input" ]; then
+  exit 0
+fi
+exit 2
+"#,
+    );
+    write_executable(&bin.join("adb"), &body);
+}
+
 fn write_adb_script_no_devices(bin: &Path) {
     write_executable(
         &bin.join("adb"),
@@ -1888,6 +2054,10 @@ if [ "$1" = "get-serialno" ]; then
   printf 'fake-serial\n'
   exit 0
 fi
+if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
+  printf 'topResumedActivity=ActivityRecord{{1 u0 com.example.app/.MainActivity t1}}\n'
+  exit 0
+fi
 if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
   printf 'Physical size: {size}\n'
   exit 0
@@ -1908,12 +2078,20 @@ fn write_adb_script_no_display(bin: &Path) {
     write_executable(
         &bin.join("adb"),
         r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nfake-serial\tdevice\n'
+  exit 0
+fi
 if [ "$1" = "get-state" ]; then
   printf 'device\n'
   exit 0
 fi
 if [ "$1" = "get-serialno" ]; then
   printf 'fake-serial\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
+  printf 'topResumedActivity=ActivityRecord{1 u0 com.example.app/.MainActivity t1}\n'
   exit 0
 fi
 if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
@@ -1950,6 +2128,10 @@ fi
 if [ "$1" = "get-serialno" ]; then
   echo "get-serialno must never run when a serial is configured" >&2
   exit 1
+fi
+if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
+  printf 'topResumedActivity=ActivityRecord{{1 u0 com.example.app/.MainActivity t1}}\n'
+  exit 0
 fi
 if [ "$1" = "shell" ] && [ "$2" = "wm" ] && [ "$3" = "size" ]; then
   printf 'Physical size: 1080x2400\n'
@@ -2019,6 +2201,50 @@ fn write_executable(path: &Path, body: &str) {
 
 fn read_json_path(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn set_android_package(root: &Path, package: &str) {
+    let path = root.join(".minimap/config.json");
+    let mut config = read_json_path(&path);
+    config["app_profiles"]["default"]["android_package"] = json!(package);
+    fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+}
+
+fn write_android_application_gradle(root: &Path, application_id: &str, debug_suffix: Option<&str>) {
+    write_android_application_gradle_module(root, "app", application_id, debug_suffix);
+}
+
+fn write_android_application_gradle_module(
+    root: &Path,
+    module: &str,
+    application_id: &str,
+    debug_suffix: Option<&str>,
+) {
+    let app = root.join(module);
+    fs::create_dir_all(&app).unwrap();
+    let suffix = debug_suffix
+        .map(|suffix| format!("applicationIdSuffix = \"{suffix}\""))
+        .unwrap_or_default();
+    fs::write(
+        app.join("build.gradle.kts"),
+        format!(
+            r#"plugins {{
+    id("com.android.application")
+}}
+android {{
+    defaultConfig {{
+        applicationId = "{application_id}"
+    }}
+    buildTypes {{
+        debug {{
+            {suffix}
+        }}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
 }
 
 fn edge_files(root: &Path) -> Vec<PathBuf> {
