@@ -194,6 +194,51 @@ fn tap_selector_with_label_creates_destination_and_edge() {
 }
 
 #[test]
+fn tap_content_desc_uses_related_clickable_node_and_records_semantic_selector() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["debug_home", "debug_home", "search"]);
+    write_adb_script(&bin);
+
+    minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["whereami", "--label", "home"])
+        .assert()
+        .success();
+    let output = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args([
+            "tap",
+            "--selector",
+            "content-desc=Debug tools",
+            "--label",
+            "debug-tools",
+            "--reason",
+            "open debug tools",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let payload: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(payload["status"], "ok");
+
+    let edges = edge_files(temp.path());
+    assert_eq!(edges.len(), 1);
+    let edge = read_json_path(&edges[0]);
+    assert_eq!(
+        edge["recipe"][0]["selector"],
+        json!({"kind": "content-desc", "value": "Debug tools"})
+    );
+    assert_eq!(edge["recipe"][0]["point"], Value::Null);
+}
+
+#[test]
 fn tap_retries_blank_post_action_layout() {
     let temp = tempfile::tempdir().unwrap();
     minimap(temp.path())
@@ -1723,6 +1768,9 @@ if [ "$1" = "layout" ]; then
   case "$ITEM" in
     home)
       printf '{{"class":"Column","children":[{{"class":"Text","text":"HOME"}},{{"class":"Button","text":"SEARCH","bounds":{{"left":100,"top":200,"right":300,"bottom":400}}}}]}}'
+      ;;
+    debug_home)
+      printf '[{{"interactions":["clickable","focusable"],"center":"[200,240]","key":3506402}},{{"interactions":["clickable","focusable"],"center":"[815,240]","key":3506402}},{{"content-desc":"Debug tools","key":3506402}},{{"interactions":["clickable","focusable"],"center":"[950,240]","key":3506402}},{{"text":"HOME","key":3506402}}]'
       ;;
     noisy_home)
       printf '%s\n%s\n' '"[{{\"text\":\"HOME\"}},{{\"content-desc\":\"Settings\",\"center\":\"[1006,147]\"}}]"' 'A newer version of Android CLI is available.'
