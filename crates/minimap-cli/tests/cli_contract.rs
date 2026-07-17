@@ -736,6 +736,78 @@ fn layout_normalizes_encoded_array_and_reports_android_notices() {
 }
 
 #[test]
+fn layout_reports_no_device_then_succeeds_when_device_is_available() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_no_devices(&bin);
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "device_unavailable");
+    assert_eq!(payload["error"]["code"], "no_device");
+    assert_eq!(payload["error"]["attempted_serial"], Value::Null);
+    assert_eq!(payload["error"]["devices"], json!([]));
+    assert!(payload["error"]["recovery"]
+        .as_str()
+        .unwrap()
+        .contains("Start an emulator or connect a device"));
+    assert_eq!(payload["layout"], json!([]));
+    assert!(
+        !bin.join("android-count").exists(),
+        "no-device preflight must not invoke android layout"
+    );
+
+    write_adb_script(&bin);
+    let success = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .success();
+    let payload: Value = serde_json::from_slice(&success.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "ok");
+    assert!(payload["layout"].is_array());
+}
+
+#[test]
+fn layout_reports_attempted_serial_and_attached_devices() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script(&bin, &["home"]);
+    write_adb_script_with_other_device(&bin);
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["--serial", "emulator-5554", "layout"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "device_unavailable");
+    assert_eq!(payload["error"]["code"], "device_not_found");
+    assert_eq!(payload["error"]["attempted_serial"], "emulator-5554");
+    assert_eq!(
+        payload["error"]["devices"],
+        json!([{"serial": "emulator-5556", "state": "device"}])
+    );
+    assert!(
+        !bin.join("android-count").exists(),
+        "an unavailable selected serial must not invoke android layout"
+    );
+}
+
+#[test]
 fn doctor_reports_healthy_environment() {
     let temp = tempfile::tempdir().unwrap();
     minimap(temp.path())
@@ -1720,12 +1792,46 @@ fn write_adb_script(bin: &Path) {
     write_adb_script_with_size(bin, "1080x2400");
 }
 
+fn write_adb_script_no_devices(bin: &Path) {
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\n\n'
+  exit 0
+fi
+if [ "$1" = "get-state" ] || [ "$1" = "get-serialno" ]; then
+  echo 'adb: no devices/emulators found' >&2
+  exit 1
+fi
+exit 2
+"#,
+    );
+}
+
+fn write_adb_script_with_other_device(bin: &Path) {
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nemulator-5556\tdevice\n'
+  exit 0
+fi
+exit 2
+"#,
+    );
+}
+
 /// Fake `adb` whose `wm size` reports a caller-chosen viewport. Used to record a
 /// geometry edge at one viewport and replay it at another (see the viewport
 /// mismatch test).
 fn write_adb_script_with_size(bin: &Path, size: &str) {
     let body = format!(
         r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nfake-serial\tdevice\n'
+  exit 0
+fi
 if [ "$1" = "get-state" ]; then
   printf 'device\n'
   exit 0
@@ -1780,6 +1886,10 @@ exit 2
 fn write_adb_script_expect_serial(bin: &Path, serial: &str) {
     let body = format!(
         r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\n{serial}\tdevice\n'
+  exit 0
+fi
 if [ "$1" != "-s" ] || [ "$2" != "{serial}" ]; then
   echo "expected -s {serial}, got: $*" >&2
   exit 1

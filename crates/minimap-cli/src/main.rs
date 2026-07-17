@@ -269,8 +269,9 @@ fn run(cli: Cli) -> Result<i32> {
             let mut android = AndroidCli::new(SubprocessRunner, serial.clone());
             let mut adb = Adb::new(SubprocessRunner, serial);
             let result = layout_result(&root, &mut android, &mut adb, diff)?;
+            let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
-            Ok(0)
+            Ok(code)
         }
     }
 }
@@ -595,6 +596,10 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
     adb: &mut Adb<DR>,
     diff: bool,
 ) -> Result<Value> {
+    if let Some(result) = layout_device_unavailable_result(adb)? {
+        return Ok(result);
+    }
+
     if !diff {
         if let Some(session) =
             load_recent_session_place(root, adb, Duration::from_secs(LAYOUT_CACHE_TTL_SECS))?
@@ -676,6 +681,74 @@ fn layout_result<AR: CommandRunner, DR: CommandRunner>(
         "changed_graph": false,
         "changed_files": []
     }))
+}
+
+fn layout_device_unavailable_result<R: CommandRunner>(adb: &mut Adb<R>) -> Result<Option<Value>> {
+    let devices = adb.devices()?;
+    let attempted_serial = adb.configured_serial().map(str::to_string);
+    let selected = attempted_serial
+        .as_ref()
+        .and_then(|serial| devices.iter().find(|device| device.serial == *serial));
+    let ready = match &attempted_serial {
+        Some(_) => selected.is_some_and(|device| device.state == "device"),
+        None => devices.iter().any(|device| device.state == "device"),
+    };
+    if ready {
+        return Ok(None);
+    }
+
+    let (code, summary, recovery) = if devices.is_empty() {
+        (
+            "no_device",
+            "no connected Android device is available".to_string(),
+            "Start an emulator or connect a device, then rerun `minimap layout`.".to_string(),
+        )
+    } else if let Some(serial) = &attempted_serial {
+        if selected.is_none() {
+            (
+                "device_not_found",
+                format!("selected Android device `{serial}` is not attached"),
+                format!("Start or connect `{serial}`, or choose an attached device with --serial."),
+            )
+        } else {
+            (
+                "device_not_ready",
+                format!("selected Android device `{serial}` is not ready"),
+                format!(
+                    "Bring `{serial}` online and authorize debugging, then rerun `minimap layout`."
+                ),
+            )
+        }
+    } else {
+        (
+            "no_ready_device",
+            "attached Android devices are not ready".to_string(),
+            "Bring one attached device online and authorize debugging, then rerun `minimap layout`."
+                .to_string(),
+        )
+    };
+
+    Ok(Some(json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": "device_unavailable",
+        "summary": summary,
+        "kind": "android_layout",
+        "layout": [],
+        "android_cli_notices": [],
+        "minimap": {"orientation": "unavailable"},
+        "error": {
+            "code": code,
+            "attempted_serial": attempted_serial,
+            "devices": devices,
+            "recovery": recovery
+        },
+        "metrics": {
+            "layout_calls_total": 0,
+            "layout_json_returned_to_agent": true
+        },
+        "changed_graph": false,
+        "changed_files": []
+    })))
 }
 
 fn tap_result<AR: CommandRunner, DR: CommandRunner>(
