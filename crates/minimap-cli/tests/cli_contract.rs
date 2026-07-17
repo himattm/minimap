@@ -926,6 +926,51 @@ fn layout_refuses_wrong_foreground_package_unless_overridden() {
 }
 
 #[test]
+fn layout_collapses_android_analytics_spool_failure_unless_verbose() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_analytics_failure_script(&bin);
+    write_adb_script(&bin);
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .code(6);
+    let stdout = String::from_utf8(failure.get_output().stdout.clone()).unwrap();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(payload["status"], "environment_error");
+    assert_eq!(
+        payload["error"]["code"],
+        "android_cli_analytics_spool_unwritable"
+    );
+    assert_eq!(
+        payload["error"]["blocked_path"],
+        "/restricted/.android/cli/analytics/metrics/spool/blocked.trk"
+    );
+    assert!(payload.get("debug").is_none());
+    assert!(!stdout.contains("JournalingUsageTracker"));
+    assert!(stdout.len() < 1_200, "default diagnostic must stay concise");
+
+    let verbose = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["--verbose", "layout"])
+        .assert()
+        .code(6);
+    let stdout = String::from_utf8(verbose.get_output().stdout.clone()).unwrap();
+    let payload: Value = serde_json::from_str(&stdout).unwrap();
+    assert!(payload["debug"]["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("JournalingUsageTracker"));
+    assert_eq!(payload["debug"]["status"], 1);
+}
+
+#[test]
 fn doctor_reports_healthy_environment() {
     let temp = tempfile::tempdir().unwrap();
     minimap(temp.path())
@@ -1870,6 +1915,19 @@ fn prepend_path(bin: &Path) -> String {
 
 fn write_android_layout_script(bin: &Path, sequence: &[&str]) {
     write_android_layout_script_with_guard(bin, sequence, "");
+}
+
+fn write_android_analytics_failure_script(bin: &Path) {
+    write_executable(
+        &bin.join("android"),
+        r#"#!/bin/sh
+printf '%s\n' 'Unable to initialize metrics, ensure %s is writable, details: %s' >&2
+printf '%s\n' 'Exception in thread "main" java.lang.RuntimeException: Unable to initialize first usage tracking spool file' >&2
+printf '%s\n' '    at com.android.tools.analytics.JournalingUsageTracker.<init>(JournalingUsageTracker.kt:87)' >&2
+printf '%s\n' 'Caused by: java.nio.file.FileSystemException: /restricted/.android/cli/analytics/metrics/spool/blocked.trk: Operation not permitted' >&2
+exit 1
+"#,
+    );
 }
 
 /// Fake `android` that exits 1 unless `layout` invocations carry

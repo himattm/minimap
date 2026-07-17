@@ -2,6 +2,8 @@ use anyhow::{bail, Context, Result};
 use minimap_schemas::Viewport;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +14,79 @@ pub struct CommandResult {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFailure {
+    pub result: CommandResult,
+}
+
+impl fmt::Display for CommandFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "command failed: {} (status {}, stderr: {})",
+            self.result.args.join(" "),
+            self.result.status,
+            self.result.stderr
+        )
+    }
+}
+
+impl StdError for CommandFailure {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidAnalyticsSpoolFailure {
+    pub blocked_path: Option<String>,
+}
+
+pub fn android_analytics_spool_failure(
+    failure: &CommandFailure,
+) -> Option<AndroidAnalyticsSpoolFailure> {
+    let program = failure.result.args.first()?;
+    if Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("android")
+    {
+        return None;
+    }
+    let stderr = &failure.result.stderr;
+    if !stderr.contains("Unable to initialize first usage tracking spool file")
+        || !(stderr.contains("Operation not permitted")
+            || stderr.contains("Permission denied")
+            || stderr.contains("Access is denied"))
+    {
+        return None;
+    }
+
+    Some(AndroidAnalyticsSpoolFailure {
+        blocked_path: analytics_blocked_path(stderr),
+    })
+}
+
+fn analytics_blocked_path(stderr: &str) -> Option<String> {
+    const EXCEPTION_MARKERS: [&str; 2] = [
+        "java.nio.file.FileSystemException:",
+        "java.nio.file.AccessDeniedException:",
+    ];
+    const REASON_MARKERS: [&str; 3] = [
+        ": Operation not permitted",
+        ": Permission denied",
+        ": Access is denied",
+    ];
+
+    stderr.lines().find_map(|line| {
+        let path_with_reason = EXCEPTION_MARKERS
+            .iter()
+            .find_map(|marker| line.split_once(marker).map(|(_, value)| value.trim()))?;
+        let path = REASON_MARKERS.iter().find_map(|marker| {
+            path_with_reason
+                .split_once(marker)
+                .map(|(path, _)| path.trim())
+        })?;
+        (!path.is_empty()).then(|| path.to_string())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -412,12 +487,7 @@ fn run_checked<R: CommandRunner>(
 ) -> Result<CommandResult> {
     let result = runner.run(&args, env)?;
     if result.status != 0 {
-        bail!(
-            "command failed: {} (status {}, stderr: {})",
-            result.args.join(" "),
-            result.status,
-            result.stderr
-        );
+        return Err(CommandFailure { result }.into());
     }
     Ok(result)
 }
@@ -1205,6 +1275,42 @@ mod tests {
             parse_foreground_package(output).as_deref(),
             Some("llc.wandersail.getgoing.debug")
         );
+    }
+
+    #[test]
+    fn classifies_android_analytics_spool_permission_failure() {
+        let failure = CommandFailure {
+            result: CommandResult {
+                args: vec!["android".to_string(), "layout".to_string()],
+                status: 1,
+                stdout: String::new(),
+                stderr: "Exception in thread \"main\" java.lang.RuntimeException: Unable to initialize first usage tracking spool file\nCaused by: java.nio.file.FileSystemException: /Users/test/.android/cli/analytics/metrics/spool/event.trk: Operation not permitted\n".to_string(),
+            },
+        };
+
+        assert_eq!(
+            android_analytics_spool_failure(&failure),
+            Some(AndroidAnalyticsSpoolFailure {
+                blocked_path: Some(
+                    "/Users/test/.android/cli/analytics/metrics/spool/event.trk".to_string()
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_misclassify_adb_permission_errors_as_android_analytics() {
+        let failure = CommandFailure {
+            result: CommandResult {
+                args: vec!["adb".to_string(), "devices".to_string()],
+                status: 1,
+                stdout: String::new(),
+                stderr: "Unable to initialize first usage tracking spool file: Permission denied"
+                    .to_string(),
+            },
+        };
+
+        assert_eq!(android_analytics_spool_failure(&failure), None);
     }
 
     #[test]

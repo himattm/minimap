@@ -70,6 +70,11 @@ Minimap verifies that package against ADB's foreground activity and refuses to
 record another app. Use `--allow-package-mismatch` only for an intentional
 cross-app capture; `doctor` reports missing or ambiguous package configuration.
 
+If Android CLI cannot initialize its analytics spool in a restricted filesystem,
+Minimap returns `android_cli_analytics_spool_unwritable` with the blocked path
+and a short permission remedy. Pass `--verbose` to include the raw subprocess
+exception when debugging; normal agent output omits the Android CLI stack trace.
+
 ## Commands
 
 The v1 command surface is intentionally small:

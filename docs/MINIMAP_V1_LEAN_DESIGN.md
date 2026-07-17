@@ -163,6 +163,11 @@ resumed activity before capture, preventing another foreground app from
 polluting the graph. `--allow-package-mismatch` is the explicit one-command
 override.
 
+Known Android CLI analytics-spool permission failures are classified at the
+subprocess boundary. Normal structured output reports the blocked path and one
+remediation without embedding Java or Rust stack traces. The global `--verbose`
+flag adds the untouched command status, stdout, and stderr for diagnostics.
+
 ## Graph Schema
 
 Places use product language instead of screen language.

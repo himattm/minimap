@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use minimap_android::{
-    parse_input_tap, parse_layout_output, resolve_selector_point, Adb, AndroidCli, CommandRunner,
-    LayoutOutput, SubprocessRunner, TapPoint,
+    android_analytics_spool_failure, parse_input_tap, parse_layout_output, resolve_selector_point,
+    Adb, AndroidCli, CommandFailure, CommandRunner, LayoutOutput, SubprocessRunner, TapPoint,
 };
 use minimap_core::{
     detect_overlay, fingerprint_layout, fingerprint_usable, match_place, normalize_label,
@@ -39,6 +39,9 @@ struct Cli {
     json: bool,
     #[arg(long)]
     quiet: bool,
+    /// Include raw subprocess diagnostics in structured error output.
+    #[arg(long, global = true)]
+    verbose: bool,
     #[arg(long = "no-color")]
     no_color: bool,
     /// Android device serial to target when more than one device is attached.
@@ -152,19 +155,51 @@ struct TapRequest<'a> {
 
 fn main() {
     let cli = Cli::parse();
+    let verbose = cli.verbose;
     let code = match run(cli) {
         Ok(code) => code,
         Err(error) => {
-            let result = MinimapResult::new(
-                "config_error",
-                error.to_string(),
-                json!({"error": {"message": error.to_string()}}),
-            );
-            print_json(&serde_json::to_value(result).expect("error json"));
-            7
+            if let Some(result) = android_analytics_error_result(&error, verbose) {
+                print_json(&result);
+                6
+            } else {
+                let result = MinimapResult::new(
+                    "config_error",
+                    error.to_string(),
+                    json!({"error": {"message": error.to_string()}}),
+                );
+                print_json(&serde_json::to_value(result).expect("error json"));
+                7
+            }
         }
     };
     std::process::exit(code);
+}
+
+fn android_analytics_error_result(error: &anyhow::Error, verbose: bool) -> Option<Value> {
+    let failure = error.downcast_ref::<CommandFailure>()?;
+    let analytics = android_analytics_spool_failure(failure)?;
+    let mut result = json!({
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "status": "environment_error",
+        "summary": "Android CLI analytics spool is not writable",
+        "error": {
+            "code": "android_cli_analytics_spool_unwritable",
+            "blocked_path": analytics.blocked_path,
+            "recovery": "Grant write access to the Android CLI analytics spool, or rerun Minimap in a filesystem profile where that path is writable."
+        },
+        "changed_graph": false,
+        "changed_files": []
+    });
+    if verbose {
+        result["debug"] = json!({
+            "command": failure.result.args,
+            "status": failure.result.status,
+            "stdout": failure.result.stdout,
+            "stderr": failure.result.stderr
+        });
+    }
+    Some(result)
 }
 
 fn run(cli: Cli) -> Result<i32> {
