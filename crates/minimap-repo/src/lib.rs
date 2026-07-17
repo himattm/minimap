@@ -86,7 +86,13 @@ fn config_with_package(android_package: String) -> MinimapConfig {
     MinimapConfig {
         schema_version: CONFIG_SCHEMA_VERSION.to_string(),
         active_app_profile: "default".to_string(),
-        app_profiles: BTreeMap::from([("default".to_string(), AppProfile { android_package })]),
+        app_profiles: BTreeMap::from([(
+            "default".to_string(),
+            AppProfile {
+                android_package,
+                android_device: None,
+            },
+        )]),
     }
 }
 

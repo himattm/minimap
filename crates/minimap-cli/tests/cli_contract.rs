@@ -858,6 +858,10 @@ fn layout_reports_no_device_then_succeeds_when_device_is_available() {
     let payload: Value = serde_json::from_slice(&success.get_output().stdout).unwrap();
     assert_eq!(payload["status"], "ok");
     assert!(payload["layout"].is_array());
+    assert_eq!(payload["device"]["serial"], "fake-serial");
+    assert_eq!(payload["device"]["model"], "Pixel 9");
+    assert_eq!(payload["device"]["api_level"], 36);
+    assert_eq!(payload["device"]["selection_source"], "single_attached");
 }
 
 #[test]
@@ -888,6 +892,67 @@ fn layout_reports_attempted_serial_and_attached_devices() {
         !bin.join("android-count").exists(),
         "an unavailable selected serial must not invoke android layout"
     );
+}
+
+#[test]
+fn layout_requires_device_selection_when_multiple_are_ready() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    let bin = fake_bin(temp.path());
+    write_android_layout_script_expect_serial(&bin, &["home"], "emulator-5554");
+    write_adb_script_two_devices_full(&bin);
+
+    let failure = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .code(6);
+    let payload: Value = serde_json::from_slice(&failure.get_output().stdout).unwrap();
+    assert_eq!(payload["status"], "device_unavailable");
+    assert_eq!(payload["error"]["code"], "device_ambiguous");
+    assert!(payload["error"]["recovery"]
+        .as_str()
+        .unwrap()
+        .contains("--device"));
+
+    let success = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["--device", "emulator-5554", "layout"])
+        .assert()
+        .success();
+    let payload: Value = serde_json::from_slice(&success.get_output().stdout).unwrap();
+    assert_eq!(payload["device"]["serial"], "emulator-5554");
+    assert_eq!(payload["device"]["model"], "Pixel 9 Pro");
+    assert_eq!(payload["device"]["api_level"], 36);
+    assert_eq!(
+        payload["device"]["selection_source"],
+        "argument_or_environment"
+    );
+}
+
+#[test]
+fn layout_resolves_device_from_the_active_app_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    minimap(temp.path())
+        .args(["init", "--agents", "codex"])
+        .assert()
+        .success();
+    set_android_device(temp.path(), "emulator-5554");
+    let bin = fake_bin(temp.path());
+    write_android_layout_script_expect_serial(&bin, &["home"], "emulator-5554");
+    write_adb_script_expect_serial(&bin, "emulator-5554");
+
+    let success = minimap(temp.path())
+        .env("PATH", prepend_path(&bin))
+        .args(["layout"])
+        .assert()
+        .success();
+    let payload: Value = serde_json::from_slice(&success.get_output().stdout).unwrap();
+    assert_eq!(payload["device"]["serial"], "emulator-5554");
+    assert_eq!(payload["device"]["selection_source"], "config");
 }
 
 #[test]
@@ -1888,13 +1953,13 @@ fn doctor_flags_multiple_devices_without_serial_and_targets_one_with_serial() {
     assert_eq!(device["status"], "fail");
     assert_eq!(
         device["hint"],
-        "multiple devices attached; pass --serial or set ANDROID_SERIAL"
+        "multiple devices attached; pass --device or set ANDROID_SERIAL"
     );
 
     // Targeting one device by serial restores a healthy doctor.
     let output = minimap(temp.path())
         .env("PATH", prepend_path(&bin))
-        .args(["doctor", "--serial", "emulator-5554"])
+        .args(["doctor", "--device", "emulator-5554"])
         .assert()
         .success()
         .get_output()
@@ -1907,6 +1972,9 @@ fn doctor_flags_multiple_devices_without_serial_and_targets_one_with_serial() {
     let device = &payload["checks"]["environment"][2];
     assert_eq!(device["status"], "pass");
     assert_eq!(device["serial"], "emulator-5554");
+    assert_eq!(device["model"], "Pixel 9 Pro");
+    assert_eq!(device["api_level"], 36);
+    assert_eq!(device["selection_source"], "argument_or_environment");
     assert!(device.get("hint").is_none());
 }
 
@@ -2068,6 +2136,10 @@ if [ "$1" = "get-serialno" ]; then
   printf 'fake-serial\n'
   exit 0
 fi
+if [ "$1" = "-s" ] && [ "$2" = "fake-serial" ] && [ "$3" = "shell" ] && [ "$4" = "getprop" ]; then
+  if [ "$5" = "ro.product.model" ]; then printf 'Pixel 9\n'; else printf '36\n'; fi
+  exit 0
+fi
 if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
   printf 'topResumedActivity=ActivityRecord{{123 u0 {package}/.MainActivity t1}}\n'
   exit 0
@@ -2133,6 +2205,10 @@ if [ "$1" = "get-serialno" ]; then
   printf 'fake-serial\n'
   exit 0
 fi
+if [ "$1" = "-s" ] && [ "$2" = "fake-serial" ] && [ "$3" = "shell" ] && [ "$4" = "getprop" ]; then
+  if [ "$5" = "ro.product.model" ]; then printf 'Pixel 9\n'; else printf '36\n'; fi
+  exit 0
+fi
 if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
   printf 'topResumedActivity=ActivityRecord{{1 u0 com.example.app/.MainActivity t1}}\n'
   exit 0
@@ -2167,6 +2243,10 @@ if [ "$1" = "get-state" ]; then
 fi
 if [ "$1" = "get-serialno" ]; then
   printf 'fake-serial\n'
+  exit 0
+fi
+if [ "$1" = "-s" ] && [ "$2" = "fake-serial" ] && [ "$3" = "shell" ] && [ "$4" = "getprop" ]; then
+  if [ "$5" = "ro.product.model" ]; then printf 'Pixel 9\n'; else printf '36\n'; fi
   exit 0
 fi
 if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
@@ -2208,6 +2288,14 @@ if [ "$1" = "get-serialno" ]; then
   echo "get-serialno must never run when a serial is configured" >&2
   exit 1
 fi
+if [ "$1" = "shell" ] && [ "$2" = "getprop" ] && [ "$3" = "ro.product.model" ]; then
+  printf 'Pixel 9 Pro\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "getprop" ] && [ "$3" = "ro.build.version.sdk" ]; then
+  printf '36\n'
+  exit 0
+fi
 if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
   printf 'topResumedActivity=ActivityRecord{{1 u0 com.example.app/.MainActivity t1}}\n'
   exit 0
@@ -2239,9 +2327,43 @@ if [ "$1" = "-s" ] && [ "$2" = "emulator-5554" ] && [ "$3" = "get-state" ]; then
   printf 'device\n'
   exit 0
 fi
+if [ "$1" = "-s" ] && [ "$2" = "emulator-5554" ] && [ "$3" = "shell" ] && [ "$4" = "getprop" ]; then
+  if [ "$5" = "ro.product.model" ]; then printf 'Pixel 9 Pro\n'; else printf '36\n'; fi
+  exit 0
+fi
 if [ "$1" = "get-state" ]; then
   echo 'adb: more than one device/emulator' >&2
   exit 1
+fi
+exit 2
+"#,
+    );
+}
+
+fn write_adb_script_two_devices_full(bin: &Path) {
+    write_executable(
+        &bin.join("adb"),
+        r#"#!/bin/sh
+if [ "$1" = "devices" ]; then
+  printf 'List of devices attached\nemulator-5554\tdevice\nemulator-5556\tdevice\n'
+  exit 0
+fi
+if [ "$1" != "-s" ] || [ "$2" != "emulator-5554" ]; then
+  echo 'adb: more than one device/emulator' >&2
+  exit 1
+fi
+shift 2
+if [ "$1" = "shell" ] && [ "$2" = "dumpsys" ] && [ "$3" = "activity" ]; then
+  printf 'topResumedActivity=ActivityRecord{1 u0 com.example.app/.MainActivity t1}\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "getprop" ] && [ "$3" = "ro.product.model" ]; then
+  printf 'Pixel 9 Pro\n'
+  exit 0
+fi
+if [ "$1" = "shell" ] && [ "$2" = "getprop" ] && [ "$3" = "ro.build.version.sdk" ]; then
+  printf '36\n'
+  exit 0
 fi
 exit 2
 "#,
@@ -2286,6 +2408,13 @@ fn set_android_package(root: &Path, package: &str) {
     let path = root.join(".minimap/config.json");
     let mut config = read_json_path(&path);
     config["app_profiles"]["default"]["android_package"] = json!(package);
+    fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+}
+
+fn set_android_device(root: &Path, serial: &str) {
+    let path = root.join(".minimap/config.json");
+    let mut config = read_json_path(&path);
+    config["app_profiles"]["default"]["android_device"] = json!(serial);
     fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 }
 

@@ -145,7 +145,8 @@ short-lived and sized for normal agent decision latency.
   "active_app_profile": "default",
   "app_profiles": {
     "default": {
-      "android_package": ""
+      "android_package": "",
+      "android_device": "emulator-5554"
     }
   }
 }
@@ -153,6 +154,9 @@ short-lived and sized for normal agent decision latency.
 
 V1 uses one active app profile. The profile fields reserve a mechanical migration
 path for multiple app maps later without adding complexity now.
+`android_device` is optional: `--device`/`ANDROID_SERIAL` wins, followed by this
+profile value, followed by automatic selection only when exactly one ready
+device is attached. Results echo serial, model, API level, and selection source.
 
 When the active profile is blank, `init` and runtime validation scan standard
 Android application Gradle modules for a literal `applicationId` and the debug
