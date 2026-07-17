@@ -82,6 +82,7 @@ The v1 command surface is intentionally small:
 ```text
 minimap init
 minimap doctor
+minimap doctor --live
 minimap whereami
 minimap go
 minimap tap
@@ -92,6 +93,11 @@ minimap layout
 
 All commands return JSON by default. Graph changes are reported with
 `changed_graph: true` and `changed_files`.
+
+Plain `doctor` validates repository, command, and device configuration without
+capturing UI. `doctor --live` additionally verifies the foreground package and
+performs one minimal layout capture, reporting install, device, app-target, and
+Android CLI permission failures as separate checks with one remediation each.
 
 ## Graph State
 

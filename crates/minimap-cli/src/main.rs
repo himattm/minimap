@@ -22,7 +22,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -76,7 +75,11 @@ enum Commands {
         no_skills: bool,
     },
     /// Check repo graph health and Android device readiness.
-    Doctor,
+    Doctor {
+        /// Probe the foreground app and perform one minimal Android layout capture.
+        #[arg(long)]
+        live: bool,
+    },
     /// Identify the current semantic place from one Android layout observation.
     Whereami {
         #[arg(long)]
@@ -294,8 +297,8 @@ fn run(cli: Cli) -> Result<i32> {
             print_json(&serde_json::to_value(result)?);
             Ok(0)
         }
-        Commands::Doctor => {
-            let result = doctor(&root, &selection);
+        Commands::Doctor { live } => {
+            let result = doctor(&root, &selection, live, cli.verbose);
             let code = exit_code_for_status(result["status"].as_str().unwrap_or("ok"));
             print_json(&result);
             Ok(code)
@@ -1750,46 +1753,172 @@ fn execute_recipe<AR: CommandRunner, DR: CommandRunner>(
     Ok(())
 }
 
-fn doctor(root: &Path, selection: &DeviceSelection) -> Value {
+fn doctor(root: &Path, selection: &DeviceSelection, live: bool, verbose: bool) -> Value {
     let serial = selection.serial.as_deref();
     let repo_checks = validate_graph(root);
     let repo_ok = repo_checks.iter().all(|check| check["status"] == "pass");
     let android_ok = command_on_path("android");
     let adb_ok = command_on_path("adb");
-    // With no serial resolved, two or more attached devices make every bare
-    // adb/android call ambiguous, so fail the device check with a fix instead
-    // of surfacing adb's opaque "more than one device" error.
-    let multi_device = serial.is_none() && adb_ok && adb_devices_in_device_state() > 1;
-    let device_ready = adb_ok && !multi_device && adb_device_ready(serial);
-    let device_identity = if device_ready {
-        Adb::new(SubprocessRunner, selection.serial.clone())
-            .device_identity()
-            .ok()
+    let devices = if adb_ok {
+        Adb::new(SubprocessRunner, None)
+            .devices()
+            .unwrap_or_default()
     } else {
-        None
+        Vec::new()
     };
+    let ready_devices = devices
+        .iter()
+        .filter(|device| device.state == "device")
+        .count();
+    let selected = serial.and_then(|serial| devices.iter().find(|device| device.serial == serial));
+    let multi_device = serial.is_none() && ready_devices > 1;
+    let device_ready = match serial {
+        Some(_) => selected.is_some_and(|device| device.state == "device"),
+        None => ready_devices == 1,
+    };
+    let identity_result = device_ready
+        .then(|| Adb::new(SubprocessRunner, selection.serial.clone()).device_identity());
+    let device_identity = identity_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok());
     let device_ok = device_identity.is_some();
     let mut device_check = json!({
         "name": "device",
         "status": if device_ok { "pass" } else { "fail" }
     });
-    if multi_device {
+    if !adb_ok {
+        device_check["code"] = json!("adb_missing");
+        device_check["hint"] = json!("Install ADB and ensure it is on PATH.");
+    } else if multi_device {
+        device_check["code"] = json!("device_ambiguous");
         device_check["hint"] =
             json!("multiple devices attached; pass --device or set ANDROID_SERIAL");
+    } else if devices.is_empty() {
+        device_check["code"] = json!("no_device");
+        device_check["hint"] = json!("Start an emulator or connect a device.");
+    } else if serial.is_some() && selected.is_none() {
+        device_check["code"] = json!("device_not_found");
+        device_check["hint"] = json!("Choose an attached serial with --device.");
+    } else if !device_ready {
+        device_check["code"] = json!("device_not_ready");
+        device_check["hint"] = json!("Bring the selected device online and authorize debugging.");
+    } else if let Some(Err(error)) = &identity_result {
+        device_check["code"] = json!("device_identity_unavailable");
+        device_check["hint"] = json!("Verify ADB can read the device model and API level.");
+        if verbose {
+            device_check["detail"] = json!(error.to_string());
+        }
     }
     if let Some(identity) = device_identity {
-        device_check["serial"] = json!(identity.serial);
-        device_check["model"] = json!(identity.model);
+        device_check["serial"] = json!(&identity.serial);
+        device_check["model"] = json!(&identity.model);
         device_check["api_level"] = json!(identity.api_level);
         device_check["selection_source"] = json!(selection.source);
     } else if let Some(serial) = serial {
         device_check["serial"] = json!(serial);
         device_check["selection_source"] = json!(selection.source);
     }
-    json!({
+
+    let mut live_checks = Vec::new();
+    let mut live_status = "ok";
+    if live && repo_ok && android_ok && adb_ok && device_ok {
+        let resolution = resolve_app_package(root);
+        let expected_package = resolution
+            .as_ref()
+            .ok()
+            .and_then(AppPackageResolution::package)
+            .map(str::to_string);
+        match expected_package {
+            None => {
+                live_status = "config_error";
+                live_checks.push(json!({
+                    "name": "foreground_app",
+                    "status": "fail",
+                    "code": "app_package_missing",
+                    "remediation": "Configure android_package for the active app profile."
+                }));
+            }
+            Some(expected_package) => {
+                let mut adb = Adb::new(SubprocessRunner, selection.serial.clone());
+                match adb.foreground_package() {
+                    Err(error) => {
+                        live_status = "environment_error";
+                        live_checks.push(json!({
+                            "name": "foreground_app",
+                            "status": "fail",
+                            "code": "foreground_package_unknown",
+                            "expected_package": expected_package,
+                            "remediation": "Launch the expected app and retry the live doctor probe.",
+                            "detail": error.to_string()
+                        }));
+                    }
+                    Ok(foreground_package) if foreground_package != expected_package => {
+                        live_status = "app_mismatch";
+                        live_checks.push(json!({
+                            "name": "foreground_app",
+                            "status": "fail",
+                            "code": "foreground_package_mismatch",
+                            "expected_package": expected_package,
+                            "foreground_package": foreground_package,
+                            "remediation": "Bring the expected app to the foreground before capture."
+                        }));
+                    }
+                    Ok(foreground_package) => {
+                        live_checks.push(json!({
+                            "name": "foreground_app",
+                            "status": "pass",
+                            "expected_package": expected_package,
+                            "foreground_package": foreground_package
+                        }));
+                        let mut android =
+                            AndroidCli::new(SubprocessRunner, selection.serial.clone());
+                        match android.layout(false) {
+                            Ok(command) => match parse_layout_output(&command.stdout) {
+                                Ok(output) => live_checks.push(json!({
+                                    "name": "layout_capture",
+                                    "status": "pass",
+                                    "element_count": output.layout.as_array().map(Vec::len).unwrap_or(0),
+                                    "notices": output.notices
+                                })),
+                                Err(error) => {
+                                    live_status = "environment_error";
+                                    live_checks.push(json!({
+                                        "name": "layout_capture",
+                                        "status": "fail",
+                                        "code": "android_layout_invalid",
+                                        "remediation": "Run minimap layout --verbose and inspect the Android CLI output.",
+                                        "detail": error.to_string()
+                                    }));
+                                }
+                            },
+                            Err(error) => {
+                                live_status = "environment_error";
+                                live_checks.push(live_layout_failure_check(&error, verbose));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let status = if !repo_ok {
+        "config_error"
+    } else if !android_ok || !adb_ok || !device_ok {
+        if live {
+            "environment_error"
+        } else {
+            "config_error"
+        }
+    } else if live {
+        live_status
+    } else {
+        "ok"
+    };
+    let mut result = json!({
         "schema_version": RESULT_SCHEMA_VERSION,
-        "status": if repo_ok && android_ok && adb_ok && device_ok { "ok" } else { "config_error" },
-        "ok": repo_ok && android_ok && adb_ok && device_ok,
+        "status": status,
+        "ok": status == "ok",
         "repo_ok": repo_ok,
         "device_ok": device_ok,
         "checks": {
@@ -1800,41 +1929,50 @@ fn doctor(root: &Path, selection: &DeviceSelection) -> Value {
                 device_check
             ]
         }
-    })
+    });
+    if live {
+        result["checks"]["live"] = json!(live_checks);
+    }
+    result
+}
+
+fn live_layout_failure_check(error: &anyhow::Error, verbose: bool) -> Value {
+    if let Some(failure) = error.downcast_ref::<CommandFailure>() {
+        if let Some(analytics) = android_analytics_spool_failure(failure) {
+            let mut check = json!({
+                "name": "layout_capture",
+                "status": "fail",
+                "code": "android_cli_analytics_spool_unwritable",
+                "blocked_path": analytics.blocked_path,
+                "remediation": "Grant write access to the Android CLI analytics spool or use a writable filesystem profile."
+            });
+            if verbose {
+                check["debug"] = json!({
+                    "command": failure.result.args,
+                    "status": failure.result.status,
+                    "stdout": failure.result.stdout,
+                    "stderr": failure.result.stderr
+                });
+            }
+            return check;
+        }
+    }
+    let mut check = json!({
+        "name": "layout_capture",
+        "status": "fail",
+        "code": "android_layout_capture_failed",
+        "remediation": "Run minimap layout --verbose and inspect the Android CLI failure."
+    });
+    if verbose {
+        check["detail"] = json!(error.to_string());
+    }
+    check
 }
 
 fn command_on_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|path| path.join(name).exists()))
         .unwrap_or(false)
-}
-
-fn adb_device_ready(serial: Option<&str>) -> bool {
-    let mut command = ProcessCommand::new("adb");
-    if let Some(serial) = serial {
-        command.args(["-s", serial]);
-    }
-    let output = command.arg("get-state").output();
-    matches!(output, Ok(output) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "device")
-}
-
-/// Count attached devices in the `device` state from `adb devices` output
-/// (lines after the header look like `emulator-5554\tdevice`).
-fn adb_devices_in_device_state() -> usize {
-    let Ok(output) = ProcessCommand::new("adb").arg("devices").output() else {
-        return 0;
-    };
-    if !output.status.success() {
-        return 0;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .skip(1)
-        .filter(|line| {
-            let mut fields = line.split_whitespace();
-            fields.next().is_some() && fields.next() == Some("device")
-        })
-        .count()
 }
 
 fn place_from_label(label: &str, baseline: &PlaceBaseline) -> Place {
