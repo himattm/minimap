@@ -521,33 +521,247 @@ pub fn resolve_selector_point(layout: &Value, selector: &str) -> Result<TapPoint
         other => vec![other],
     };
     let expected = expected.trim();
-    for node in walk_nodes(layout) {
-        for k in &candidates {
-            if node.get(*k).and_then(Value::as_str) == Some(expected) {
-                return center_of(node).context("matched node has no tap bounds");
-            }
-        }
+    let nodes = walk_nodes(layout);
+    let matches: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            candidates
+                .iter()
+                .any(|key| node.node.get(*key).and_then(Value::as_str) == Some(expected))
+                .then_some(index)
+        })
+        .collect();
+    if matches.is_empty() {
+        bail!("Selector not found: {selector}");
     }
-    bail!("Selector not found: {selector}")
+
+    let mut resolved: Vec<_> = matches
+        .iter()
+        .flat_map(|matched| selector_candidates(&nodes, *matched))
+        .collect();
+    resolved.sort_by_key(|candidate| candidate.score);
+    if let Some(candidate) = resolved.first() {
+        return Ok(candidate.point);
+    }
+
+    let considered = related_node_indices(&nodes, &matches);
+    let mut described = considered
+        .iter()
+        .take(8)
+        .map(|index| describe_node(*index, nodes[*index].node))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if considered.len() > 8 {
+        described.push_str(&format!("; ... {} more", considered.len() - 8));
+    }
+    bail!(
+        "Selector matched {} node(s) but no related tappable node was found after considering {} related node(s): {}",
+        matches.len(),
+        considered.len(),
+        described
+    )
 }
 
-fn walk_nodes(value: &Value) -> Vec<&serde_json::Map<String, Value>> {
+#[derive(Clone, Copy)]
+struct NodeRef<'a> {
+    node: &'a serde_json::Map<String, Value>,
+    parent: Option<usize>,
+    depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SelectorCandidate {
+    // relation rank, relation distance, matched node index, candidate index
+    score: (u8, u128, usize, usize),
+    point: TapPoint,
+}
+
+fn walk_nodes(value: &Value) -> Vec<NodeRef<'_>> {
     let mut nodes = Vec::new();
+    collect_nodes(value, None, 0, &mut nodes);
+    nodes
+}
+
+fn collect_nodes<'a>(
+    value: &'a Value,
+    parent: Option<usize>,
+    depth: usize,
+    nodes: &mut Vec<NodeRef<'a>>,
+) {
     if let Value::Object(map) = value {
-        nodes.push(map);
+        let index = nodes.len();
+        nodes.push(NodeRef {
+            node: map,
+            parent,
+            depth,
+        });
         for key in ["children", "nodes"] {
             if let Some(Value::Array(children)) = map.get(key) {
                 for child in children {
-                    nodes.extend(walk_nodes(child));
+                    collect_nodes(child, Some(index), depth + 1, nodes);
                 }
             }
         }
     } else if let Value::Array(values) = value {
         for value in values {
-            nodes.extend(walk_nodes(value));
+            collect_nodes(value, parent, depth, nodes);
         }
     }
+}
+
+fn selector_candidates(nodes: &[NodeRef<'_>], matched: usize) -> Vec<SelectorCandidate> {
+    let mut candidates = Vec::new();
+    let matched_node = nodes[matched].node;
+
+    for (index, candidate) in nodes.iter().enumerate() {
+        let Some(point) = center_of(candidate.node) else {
+            continue;
+        };
+        if index == matched && is_actionable(candidate.node) {
+            candidates.push(SelectorCandidate {
+                score: (0, 0, matched, index),
+                point,
+            });
+            continue;
+        }
+        if !is_actionable(candidate.node) {
+            continue;
+        }
+
+        let relation = if let Some(distance) = tree_distance(nodes, matched, index) {
+            Some((1, distance as u128))
+        } else if shares_identity(matched_node, candidate.node) {
+            Some((2, matched.abs_diff(index) as u128))
+        } else if geometries_overlap(matched_node, candidate.node) {
+            Some((3, point_distance_squared(center_of(matched_node), point)))
+        } else {
+            None
+        };
+        if let Some((rank, distance)) = relation {
+            candidates.push(SelectorCandidate {
+                score: (rank, distance, matched, index),
+                point,
+            });
+        }
+    }
+
+    // Preserve the legacy behavior for a selector-bearing node with geometry,
+    // but prefer a related actionable node whenever one is available.
+    if let Some(point) = center_of(matched_node) {
+        candidates.push(SelectorCandidate {
+            score: (4, 0, matched, matched),
+            point,
+        });
+    }
+    candidates
+}
+
+fn related_node_indices(nodes: &[NodeRef<'_>], matches: &[usize]) -> Vec<usize> {
     nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            matches
+                .iter()
+                .any(|matched| {
+                    index == *matched
+                        || tree_distance(nodes, *matched, index).is_some()
+                        || shares_identity(nodes[*matched].node, candidate.node)
+                        || geometries_overlap(nodes[*matched].node, candidate.node)
+                })
+                .then_some(index)
+        })
+        .collect()
+}
+
+fn is_actionable(node: &serde_json::Map<String, Value>) -> bool {
+    let interaction = node
+        .get("interactions")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| matches!(value.as_str(), Some("clickable" | "long-clickable")))
+        });
+    interaction
+        || node.get("clickable").and_then(Value::as_bool) == Some(true)
+        || node
+            .get("class")
+            .and_then(Value::as_str)
+            .is_some_and(|class| class.ends_with("Button"))
+}
+
+fn tree_distance(nodes: &[NodeRef<'_>], first: usize, second: usize) -> Option<usize> {
+    ancestor_distance(nodes, first, second).or_else(|| ancestor_distance(nodes, second, first))
+}
+
+fn ancestor_distance(nodes: &[NodeRef<'_>], ancestor: usize, descendant: usize) -> Option<usize> {
+    let mut current = Some(descendant);
+    while let Some(index) = current {
+        if index == ancestor {
+            return Some(
+                nodes[descendant]
+                    .depth
+                    .saturating_sub(nodes[ancestor].depth),
+            );
+        }
+        current = nodes[index].parent;
+    }
+    None
+}
+
+const IDENTITY_KEYS: &[&str] = &["key", "node-id", "nodeId", "semantics-id", "semanticsId"];
+
+fn shares_identity(
+    first: &serde_json::Map<String, Value>,
+    second: &serde_json::Map<String, Value>,
+) -> bool {
+    IDENTITY_KEYS.iter().any(|key| {
+        first
+            .get(*key)
+            .filter(|value| !value.is_null())
+            .zip(second.get(*key).filter(|value| !value.is_null()))
+            .is_some_and(|(first, second)| first == second)
+    })
+}
+
+fn point_distance_squared(first: Option<TapPoint>, second: TapPoint) -> u128 {
+    let Some(first) = first else {
+        return 0;
+    };
+    let dx = i128::from(first.x) - i128::from(second.x);
+    let dy = i128::from(first.y) - i128::from(second.y);
+    (dx * dx + dy * dy) as u128
+}
+
+fn geometries_overlap(
+    first: &serde_json::Map<String, Value>,
+    second: &serde_json::Map<String, Value>,
+) -> bool {
+    if let (Some(first), Some(second)) = (bounds_rect(first), bounds_rect(second)) {
+        return first.left <= second.right
+            && first.right >= second.left
+            && first.top <= second.bottom
+            && first.bottom >= second.top;
+    }
+    matches!((center_of(first), center_of(second)), (Some(first), Some(second)) if first == second)
+}
+
+fn describe_node(index: usize, node: &serde_json::Map<String, Value>) -> String {
+    let identities = IDENTITY_KEYS
+        .iter()
+        .filter_map(|key| node.get(*key).map(|value| format!("{key}={value}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let interactions = node
+        .get("interactions")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "[]".to_string());
+    let geometry = center_of(node)
+        .map(|point| format!("[{},{}]", point.x, point.y))
+        .unwrap_or_else(|| "none".to_string());
+    format!("#{index}(identity=[{identities}], interactions={interactions}, geometry={geometry})")
 }
 
 fn center_of(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
@@ -561,6 +775,22 @@ fn center_of(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
 }
 
 fn bounds_center(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
+    let bounds = bounds_rect(node)?;
+    Some(TapPoint {
+        x: ((bounds.left + bounds.right) / 2.0).round() as i64,
+        y: ((bounds.top + bounds.bottom) / 2.0).round() as i64,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+fn bounds_rect(node: &serde_json::Map<String, Value>) -> Option<Rect> {
     match node.get("bounds")? {
         Value::Object(bounds) => {
             let left = number(bounds, &["left", "x", "minX"])?;
@@ -573,9 +803,11 @@ fn bounds_center(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
                 let height = number(bounds, &["height"])?;
                 Some(top + height)
             })?;
-            Some(TapPoint {
-                x: ((left + right) / 2.0).round() as i64,
-                y: ((top + bottom) / 2.0).round() as i64,
+            Some(Rect {
+                left,
+                top,
+                right,
+                bottom,
             })
         }
         Value::Array(values) if values.len() == 4 => {
@@ -583,13 +815,30 @@ fn bounds_center(node: &serde_json::Map<String, Value>) -> Option<TapPoint> {
             let top = values[1].as_f64()?;
             let right = values[2].as_f64()?;
             let bottom = values[3].as_f64()?;
-            Some(TapPoint {
-                x: ((left + right) / 2.0).round() as i64,
-                y: ((top + bottom) / 2.0).round() as i64,
+            Some(Rect {
+                left,
+                top,
+                right,
+                bottom,
             })
         }
+        Value::String(bounds) => parse_bounds_string(bounds),
         _ => None,
     }
+}
+
+fn parse_bounds_string(bounds: &str) -> Option<Rect> {
+    let (first, second) = bounds.trim().split_once("][")?;
+    let first = first.strip_prefix('[')?;
+    let second = second.strip_suffix(']')?;
+    let (left, top) = first.split_once(',')?;
+    let (right, bottom) = second.split_once(',')?;
+    Some(Rect {
+        left: left.trim().parse().ok()?,
+        top: top.trim().parse().ok()?,
+        right: right.trim().parse().ok()?,
+        bottom: bottom.trim().parse().ok()?,
+    })
 }
 
 fn parse_center_string(s: &str) -> Option<TapPoint> {
@@ -766,6 +1015,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["action"]["point"], json!({"x": 1006, "y": 147}));
+    }
+
+    #[test]
+    fn selector_uses_nearest_actionable_node_with_shared_identity() {
+        // Android CLI can split one Compose semantics target into adjacent flat
+        // records. The window-level key is shared broadly, so flat-list distance
+        // disambiguates the actionable record associated with the label.
+        let layout = json!([
+            {"interactions": ["clickable"], "center": "[200,240]", "key": 3506402},
+            {"interactions": ["clickable"], "center": "[815,240]", "key": 3506402},
+            {"content-desc": "Debug tools", "key": 3506402},
+            {"interactions": ["clickable"], "center": "[950,240]", "key": 3506402}
+        ]);
+        assert_eq!(
+            resolve_selector_point(&layout, "content-desc=Debug tools").unwrap(),
+            TapPoint { x: 815, y: 240 }
+        );
+    }
+
+    #[test]
+    fn selector_uses_actionable_ancestor() {
+        let layout = json!({
+            "interactions": ["clickable"],
+            "center": "[815,240]",
+            "children": [{"content-desc": "Debug tools"}]
+        });
+        assert_eq!(
+            resolve_selector_point(&layout, "content-desc=Debug tools").unwrap(),
+            TapPoint { x: 815, y: 240 }
+        );
+    }
+
+    #[test]
+    fn selector_prefers_overlapping_actionable_bounds() {
+        let layout = json!([
+            {"content-desc": "Debug tools", "bounds": "[800,200][830,260]"},
+            {"interactions": ["clickable"], "bounds": "[790,190][850,270]"}
+        ]);
+        assert_eq!(
+            resolve_selector_point(&layout, "content-desc=Debug tools").unwrap(),
+            TapPoint { x: 820, y: 230 }
+        );
+    }
+
+    #[test]
+    fn selector_failure_describes_nodes_considered() {
+        let layout = json!([
+            {"content-desc": "Debug tools", "key": 7},
+            {"text": "Unrelated", "key": 7}
+        ]);
+        let error = resolve_selector_point(&layout, "content-desc=Debug tools")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("after considering 2 related node(s)"));
+        assert!(error.contains("#0(identity=[key=7]"));
+        assert!(error.contains("#1(identity=[key=7]"));
+        assert!(error.contains("geometry=none"));
     }
 
     #[test]
