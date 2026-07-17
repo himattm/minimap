@@ -118,6 +118,12 @@ pub struct TapPoint {
     pub y: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdbDevice {
+    pub serial: String,
+    pub state: String,
+}
+
 pub fn parse_input_tap(output: &str) -> Result<TapPoint> {
     let words: Vec<_> = output.split_whitespace().collect();
     for window in words.windows(4) {
@@ -232,6 +238,21 @@ impl<R: CommandRunner> Adb<R> {
         args
     }
 
+    pub fn configured_serial(&self) -> Option<&str> {
+        self.serial.as_deref()
+    }
+
+    /// List all attached devices without applying the configured `-s` target.
+    /// The full list is needed to explain why a selected device is unavailable.
+    pub fn devices(&mut self) -> Result<Vec<AdbDevice>> {
+        let result = run_checked(
+            &mut self.runner,
+            vec![self.adb_bin.clone(), "devices".to_string()],
+            &[],
+        )?;
+        Ok(parse_adb_devices(&result.stdout))
+    }
+
     pub fn tap(&mut self, point: TapPoint) -> Result<CommandResult> {
         let mut args = self.base_args();
         args.extend([
@@ -295,6 +316,23 @@ impl<R: CommandRunner> Adb<R> {
         let result = run_checked(&mut self.runner, args, &[])?;
         parse_wm_size(&result.stdout)
     }
+}
+
+pub fn parse_adb_devices(stdout: &str) -> Vec<AdbDevice> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("List of devices attached"))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let serial = fields.next()?;
+            let state = fields.next()?;
+            Some(AdbDevice {
+                serial: serial.to_string(),
+                state: state.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Parse `adb shell wm size` output. When `Override size:` is present it wins
@@ -788,6 +826,39 @@ mod tests {
                 height: 2400
             }
         );
+    }
+
+    #[test]
+    fn parse_adb_devices_preserves_serial_and_state() {
+        let devices = parse_adb_devices(
+            "List of devices attached\nemulator-5554\tdevice\nphone-1\tunauthorized\n\n",
+        );
+        assert_eq!(
+            devices,
+            vec![
+                AdbDevice {
+                    serial: "emulator-5554".to_string(),
+                    state: "device".to_string(),
+                },
+                AdbDevice {
+                    serial: "phone-1".to_string(),
+                    state: "unauthorized".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn adb_devices_does_not_apply_configured_serial() {
+        let mut runner = FakeRunner::new(vec![ok(
+            &["adb", "devices"],
+            "List of devices attached\nemulator-5554\tdevice\n",
+        )]);
+        {
+            let mut adb = Adb::new(&mut runner, Some("emulator-5554".to_string()));
+            assert_eq!(adb.devices().unwrap()[0].serial, "emulator-5554");
+        }
+        assert_eq!(runner.calls[0], vec!["adb", "devices"]);
     }
 
     #[test]
